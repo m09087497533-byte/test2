@@ -11,6 +11,21 @@ from subtitles import write_srt
 from titles import write_name_ass
 
 
+def resolve_photo_layout(item, settings):
+    # The actual downloaded image decides the format; search metadata can be wrong.
+    layout = settings.get('photo_layout', 'auto')
+    if item.get('photo_layout_manual'):
+        layout = item.get('photo_layout') or layout
+    elif 'photo_layout' not in settings:
+        layout = item.get('photo_layout') or layout
+    if layout == 'auto':
+        from PIL import Image, ImageOps
+        with Image.open(item['footage_path']) as image:
+            w, h = ImageOps.exif_transpose(image).size
+        return 'portrait_triptych' if h > w else 'full_bleed'
+    return layout
+
+
 def photo_card_graph(width, height, fps, effect='slide_up', triptych=False):
     """9:16 на белом поле; три копии — композиция внутри одной сцены, не смена сюжетов."""
     count = 3 if triptych and width > height else 1
@@ -45,6 +60,24 @@ def photo_card_graph(width, height, fps, effect='slide_up', triptych=False):
         previous = f'o{i}'
     graph.append(f'[{previous}]format=yuv420p,setsar=1,setpts=PTS-STARTPTS[out]')
     return ';'.join(graph)
+
+
+def wide_photo_graph(width, height, fps, effect='slide_up'):
+    """Landscape photos keep their aspect ratio and use the selected appearance effect."""
+    filters = (f'fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,'
+               'setsar=1,format=rgba')
+    x, y = '(main_w-overlay_w)/2', '(main_h-overlay_h)/2'
+    if effect == 'slide_up':
+        y += f'+{height * 0.07}*max(0,1-t/0.35)'
+    elif effect == 'slide_left':
+        x += f'+{width * 0.08}*max(0,1-t/0.35)'
+    elif effect in ('pop', 'slow_zoom'):
+        zoom = '0.92+0.08*min(1,t/0.35)' if effect == 'pop' else '1+0.008*t'
+        filters += f",scale=w='trunc(iw*({zoom})/2)*2':h='trunc(ih*({zoom})/2)*2':eval=frame"
+    if effect != 'none':
+        filters += ',fade=t=in:st=0:d=0.20:alpha=1'
+    return (f'[1:v]{filters}[photo];[0:v][photo]overlay=x=\'{x}\':y=\'{y}\':'
+            'eof_action=repeat:shortest=1,format=yuv420p,setsar=1,setpts=PTS-STARTPTS[out]')
 
 
 def run(command, cwd=None, timeout=600):
@@ -89,27 +122,33 @@ def make_clip(item, out, width, height, fps, transition, index, settings=None):
     length = frames / fps
     path = Path(item['footage_path']).resolve()
     kind = item.get('media_kind') or media_kind(path)
-    base = f'scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1'
     if kind == 'photo':
-        layout = item.get('photo_layout') or settings.get('photo_layout', 'portrait_triptych')
+        layout = resolve_photo_layout(item, settings)
+        from PIL import Image, ImageOps
+        with Image.open(path) as original:
+            if original.getexif().get(274, 1) != 1:
+                # FFmpeg does not consistently honour JPEG EXIF orientation.
+                oriented = ImageOps.exif_transpose(original)
+                if oriented.mode not in ('RGB', 'RGBA'):
+                    oriented = oriented.convert('RGB')
+                path = out.with_name(out.stem + '_oriented.png')
+                oriented.save(path)
         effect = item.get('effect') or settings.get('photo_effect', 'slide_up')
         if layout in ('portrait_card', 'portrait_triptych'):
             graph = photo_card_graph(width, height, fps, effect, layout == 'portrait_triptych')
-            run(['ffmpeg', '-y', '-v', 'error', '-filter_complex_threads', '1',
-                 '-f', 'lavfi', '-i', f'color=white:s={width}x{height}:r={fps}:d={length}',
-                 '-loop', '1', '-framerate', str(fps), '-i', str(path),
-                 '-filter_complex', graph, '-map', '[out]', '-frames:v', str(frames), '-an',
-                 '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '20',
-                 '-pix_fmt', 'yuv420p', '-r', str(fps), str(out)], timeout=max(120, length * 20))
-            return
-        # Один входной кадр -> строго нужное число кадров zoompan.
-        progress = f'on/{max(1, frames - 1)}'
-        zoom = f'1+0.06*{progress}' if effect != 'none' else '1'
-        vf = (f'scale={width * 2}:{height * 2}:force_original_aspect_ratio=increase,'
-              f'crop={width * 2}:{height * 2},'
-              f"zoompan=z='{zoom}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':"
-              f'd={frames}:s={width}x{height}:fps={fps},setsar=1')
-        inputs = ['-i', str(path)]
+        else:
+            graph = wide_photo_graph(width, height, fps, effect)
+        fade = min(transition, length / 3)
+        if fade > 0:
+            graph = graph.replace('[out]', f'[photo_out];[photo_out]fade=t=in:st=0:d={fade},'
+                                  f'fade=t=out:st={length - fade}:d={fade}[out]')
+        run(['ffmpeg', '-y', '-v', 'error', '-filter_complex_threads', '1',
+             '-f', 'lavfi', '-i', f'color=white:s={width}x{height}:r={fps}:d={length}',
+             '-loop', '1', '-framerate', str(fps), '-i', str(path),
+             '-filter_complex', graph, '-map', '[out]', '-frames:v', str(frames), '-an',
+             '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '20',
+             '-pix_fmt', 'yuv420p', '-r', str(fps), str(out)], timeout=max(120, length * 20))
+        return
     else:
         start = float(item.get('source_start', 0))
         source_duration = duration(path)
@@ -133,8 +172,6 @@ def make_clip(item, out, width, height, fps, transition, index, settings=None):
     if fade > 0:
         vf += f',fade=t=in:st=0:d={fade},fade=t=out:st={length - fade}:d={fade}'
     vf += ',format=yuv420p'
-    if kind == 'photo':
-        vf += ',setpts=PTS-STARTPTS'
     run(['ffmpeg', '-y', '-v', 'error', '-filter_threads', '1', *inputs,
          '-map', '0:v:0', '-vf', vf, '-frames:v', str(frames), '-an',
          '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '20',

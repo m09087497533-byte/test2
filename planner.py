@@ -5,7 +5,7 @@ import math
 import re
 from pathlib import Path
 
-import photo
+from fastgen_text import json_object
 from project import validate_segments
 
 EFFECTS = ('slide_up', 'slide_left', 'pop', 'fade', 'slow_zoom', 'none')
@@ -13,22 +13,7 @@ DEFAULTS = {'min_scene': 6.0, 'photo_max': 14.0, 'video_max': 8.0}
 
 
 def llm_json(prompt):
-    if not photo.FASTGEN_API_KEY:
-        raise RuntimeError('Для смыслового плана нужен FASTGEN_API_KEY. Добавьте его в настройках ключей.')
-    try:
-        response = photo._fastgen_post('/api/v6/prompts/generate', {'user_prompt': prompt})
-    except Exception as exc:
-        raise RuntimeError('Fast-gen недоступен для смыслового планирования. '
-                           'Проверьте ключ/доступ; существующий проект сохранён.') from exc
-    text = response.get('generated_text', '').strip()
-    text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text)
-    try:
-        value = json.loads(text)
-    except (TypeError, ValueError) as exc:
-        raise ValueError('Fast-gen вернул некорректный JSON; проект не изменён.') from exc
-    if not isinstance(value, dict):
-        raise ValueError('План должен быть JSON-объектом')
-    return value
+    return json_object(prompt)
 
 
 def normal(text):
@@ -234,16 +219,17 @@ def plan_story(segments, settings=None, log=print, cancelled=lambda: False):
             '"subject":"specific person/event", "query":"exact search in narration language",'
             '"query_en":"exact English search", "reason":"why this illustrates these words",'
             '"effect":"slide_up|slide_left|pop|fade|slow_zoom|none", '
-            '"photo_layout":"portrait_triptych|portrait_card|full_bleed"}]}. '
+            '"photo_layout":"auto"}]}. '
             'Cover every unit exactly once, consecutively with first/last inclusive. '
             'Group adjacent units about the same subject into coherent shots. '
             f'Aim for {settings["min_scene"]}–{settings["photo_max"]}s photos, '
             f'{settings["min_scene"]}–{settings["video_max"]}s video, never rapid word-by-word cuts. '
             'Choose media by meaning; NEVER use a repeating photo/video pattern. '
-            'Named people: authentic portraits, exact name in queries. '
-            'Portrait visual style: three vertical 9:16 copies sequentially appearing left-to-right on white; '
-            'use portrait_triptych for person introductions, portrait_card for a single portrait, '
-            'full_bleed for wide archive photographs. Do not repeat the same image across separate scenes. '
+            'Named people: authentic photographs, exact name in queries. '
+            'Find relevant photographs of any orientation: landscape 16:9 and vertical 9:16 are both welcome. '
+            'Never constrain search queries to portrait or vertical orientation. Use photo_layout auto; '
+            'the downloaded image determines whether to show a wide photo or portrait composition. '
+            'Do not repeat the same image across separate scenes. '
             'Named historical events, locations, speeches: YouTube documentary/archive footage with exact entity/year. '
             'Use stock only for genuinely generic visual actions. Never substitute random night streets for a named person. '
             'Pronouns retain the current person from context. Preserve dates, geography, historical era in search queries. '
@@ -262,8 +248,7 @@ def plan_story(segments, settings=None, log=print, cancelled=lambda: False):
                      'query_en': str(group.get('query_en', group['query'])).strip(),
                      'visual_reason': str(group.get('reason', '')),
                      'effect': group.get('effect') if group.get('effect') in EFFECTS else 'slide_up',
-                     'photo_layout': group.get('photo_layout') if group.get('photo_layout') in
-                         ('portrait_triptych', 'portrait_card', 'full_bleed') else 'portrait_triptych',
+                     'photo_layout': 'auto',
                      'strict_relevance': True, 'review_status': 'unassigned'}
             planned.append(scene)
         log(f'План: обработано {min(offset + 32, len(units))}/{len(units)} частей рассказа')

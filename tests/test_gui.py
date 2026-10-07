@@ -26,6 +26,8 @@ class GuiTests(unittest.TestCase):
         self.root.update()
 
     def tearDown(self):
+        for timer in self.root.tk.call('after', 'info'):
+            self.root.after_cancel(timer)
         self.root.destroy()
         self.tmp.cleanup()
 
@@ -54,6 +56,38 @@ class GuiTests(unittest.TestCase):
             self.wait_task()
             showerror.assert_called_once()
         self.assertTrue(all(str(widget['state']) == state for widget, state in self.app.controls))
+
+    def test_cards_keep_selection_and_discard_previous_scene_thumbnail(self):
+        from PIL import Image
+        self.app.project.segments[0]['candidates'] = [
+            {'id': 'one', 'provider': 'local', 'title': 'Первый вариант'},
+            {'id': 'two', 'provider': 'local', 'title': 'Второй вариант'}]
+        self.app.fill_candidates()
+        self.root.update()
+        self.app.choose_card(1)
+        self.app.source_start.set('12.5')
+        self.root.update()  # Queued TreeviewSelect must not reset the manually entered time.
+        self.assertEqual(self.app.candidate['id'], 'two')
+        self.assertEqual(self.app.source_start.get(), '12.5')
+        old_generation = self.app.card_generation
+        previous_buttons = [card['button'] for card in self.app.card_widgets.values()]
+        self.app.clear_cards()
+        self.app.events.put(('card_image', (old_generation, 1, Image.new('RGB', (200, 100)))))
+        self.app.poll()
+        self.assertFalse(self.app.card_images)
+        self.assertTrue(all(widget not in previous_buttons for widget, _ in self.app.controls))
+
+    def test_compact_window_keeps_assignment_controls_and_log_visible(self):
+        self.root.deiconify()
+        self.root.geometry('1280x850')
+        self.app.project.segments[0]['candidates'] = [{'id': 'one', 'provider': 'local', 'title': 'Фото'}]
+        self.app.fill_candidates()
+        self.root.update()
+        for widget in [self.app.log_box, self.app.cards_canvas] + [w for w, _ in self.app.controls
+                if w.winfo_class() == 'TButton' and w.cget('text') in ('Назначить выбранное', 'Превью сцены', 'Собрать видео')]:
+            self.assertTrue(widget.winfo_ismapped(), str(widget))
+            self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
+                                 self.root.winfo_rooty() + self.root.winfo_height())
 
 
 if __name__ == '__main__':

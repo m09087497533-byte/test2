@@ -46,7 +46,7 @@ class Project:
         self.settings = {
             'pattern': 'По смыслу рассказа', 'width': 1280, 'height': 720, 'fps': 25,
             'transition': 0, 'subtitles': False, 'allow_external': False,
-            'photo_layout': 'portrait_triptych', 'photo_effect': 'slide_up',
+            'photo_layout': 'auto', 'photo_effect': 'slide_up',
             'name_titles_enabled': True, 'min_scene': 6.0, 'photo_max': 14.0, 'video_max': 8.0,
         }
 
@@ -103,7 +103,7 @@ class Project:
 
     def save(self):
         self.ensure_dirs()
-        data = {'version': 3, 'audio_path': str(self.audio_path),
+        data = {'version': 4, 'audio_path': str(self.audio_path),
                 'segments': self.segments, 'settings': self.settings}
         data.update(story=self.story, name_titles=self.name_titles, raw_transcript=self.raw_transcript)
         tmp = self.project_file.with_suffix('.json.tmp')
@@ -115,6 +115,8 @@ class Project:
             return False
         data = json.loads(self.project_file.read_text(encoding='utf-8'))
         self.settings.update(data.get('settings', {}))
+        if data.get('version', 0) < 4 and self.settings['photo_layout'] == 'portrait_triptych':
+            self.settings['photo_layout'] = 'auto'
         self.segments = data.get('segments', [])
         self.story = data.get('story', {})
         self.name_titles = data.get('name_titles', [])

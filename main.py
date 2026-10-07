@@ -23,9 +23,18 @@ from project import Project, PATTERNS
 
 KINDS = {'По смыслу': 'auto', 'Фото': 'photo', 'Стоки': 'stock', 'YouTube': 'youtube', 'Интернет-видео': 'web'}
 LABELS = {v: k for k, v in KINDS.items()}
-LAYOUTS = {'Три портрета 9:16': 'portrait_triptych', 'Один портрет 9:16': 'portrait_card', 'Фото на весь кадр': 'full_bleed'}
+LAYOUTS = {'Авто: 16:9 или 9:16': 'auto', 'Три портрета 9:16': 'portrait_triptych',
+           'Один портрет 9:16': 'portrait_card', 'Фото на весь кадр 16:9': 'full_bleed'}
 EFFECTS = {'Появление снизу': 'slide_up', 'Появление сбоку': 'slide_left', 'Мягкое появление': 'fade',
            'Увеличение при появлении': 'pop', 'Плавный зум': 'slow_zoom', 'Без эффекта': 'none'}
+
+
+def timecode(seconds):
+    millis = round(float(seconds) * 1000)
+    hours, millis = divmod(millis, 3600000)
+    minutes, millis = divmod(millis, 60000)
+    secs, millis = divmod(millis, 1000)
+    return f'{hours:02}:{minutes:02}:{secs:02}.{millis:03}'
 
 
 def doctor():
@@ -57,133 +66,183 @@ class App:
         self.selected = None
         self.candidate = None
         self.preview_ref = None
-        root.title('SceneMix 2 — монтаж по рассказу')
-        root.geometry('1280x940')
+        import theme
+        self.colors = theme
+        self.style = theme.apply(root, ttk)
+        self.card_generation = 0
+        self.card_widgets = {}
+        self.card_images = {}
+        self.card_originals = {}
+        root.title('SceneMix 3 — цветной редактор · монтаж по рассказу')
+        root.geometry(f'{min(1440, root.winfo_screenwidth() - 60)}x{min(960, root.winfo_screenheight() - 80)}')
         root.minsize(1080, 780)
         root.protocol('WM_DELETE_WINDOW', self.close)
-        outer = ttk.Frame(root, padding=12)
+        outer = ttk.Frame(root, padding=16)
         outer.pack(fill='both', expand=True)
         top = ttk.Frame(outer)
-        top.pack(fill='x')
-        self.button(top, 'Открыть озвучку', self.pick_audio).pack(side='left')
-        self.button(top, 'Транскрибировать', self.transcribe_audio).pack(side='left', padx=6)
-        self.button(top, 'Импорт SRT / VTT', self.import_subtitles).pack(side='left')
-        self.button(top, 'API-ключи', self.key_settings).pack(side='left', padx=6)
-        self.audio_label = ttk.Label(top, text='Выберите аудио')
-        self.audio_label.pack(side='left', padx=12)
-        settings = ttk.LabelFrame(outer, text='Монтаж', padding=8)
-        settings.pack(fill='x', pady=10)
+        top.pack(fill='x', pady=(0, 12))
+        self.toolbar_items = [ttk.Label(top, text='SceneMix 3', style='Title.TLabel')]
+        for label, command, color in [('Аудио', self.pick_audio, 'Blue'),
+                ('Распознать', self.transcribe_audio, None), ('SRT / VTT', self.import_subtitles, None),
+                ('API-ключи', self.key_settings, None), ('Смысловой план', self.make_plan, 'Peach'),
+                ('Подобрать все', self.auto_pick, 'Purple'), ('Собрать видео', self.render, 'Green')]:
+            self.toolbar_items.append(self.button(top, label, command, color))
+        for i, widget in enumerate(self.toolbar_items):
+            widget.grid(row=0, column=i, padx=(0, 6), pady=2, sticky='w')
+        top.bind('<Configure>', self.resize_toolbar)
+        counts = ttk.Frame(outer)
+        counts.pack(fill='x', pady=(0, 10))
+        self.audio_label = ttk.Label(counts, text='Аудио не выбрано', style='Muted.TLabel')
+        self.audio_label.pack(side='left', padx=(0, 20))
+        self.transcript_status = ttk.Label(counts, text='Транскрипция: —', style='Success.TLabel')
+        self.transcript_status.pack(side='left', padx=12)
+        self.media_status = ttk.Label(counts, text='Материалы: —', style='Success.TLabel')
+        self.media_status.pack(side='left', padx=12)
         self.pattern = tk.StringVar(value='По смыслу рассказа')
-        self.button(settings, 'Смысловой план', self.make_plan).pack(side='left', padx=5)
-        ttk.Label(settings, text='Фото 6–14с · видео до 8с').pack(side='left', padx=5)
         self.resolution = tk.StringVar(value='1280×720')
-        self.combo(settings, self.resolution, ['1280×720', '1920×1080', '720×1280'], 13).pack(side='left', padx=4)
-        ttk.Label(settings, text='Затемнение, сек:').pack(side='left')
         self.fade = tk.StringVar(value='0')
-        fade_entry = ttk.Entry(settings, textvariable=self.fade, width=5)
-        fade_entry.pack(side='left', padx=4)
-        self.controls.append((fade_entry, 'normal'))
         self.burn_subs = tk.BooleanVar(value=False)
-        check = ttk.Checkbutton(settings, text='Субтитры', variable=self.burn_subs)
-        check.pack(side='left', padx=4)
-        self.controls.append((check, 'normal'))
-        self.external = tk.BooleanVar(value=False)
         row = ttk.Frame(outer)
-        row.pack(fill='x', pady=(0, 5))
-        self.layout = tk.StringVar(value='Три портрета 9:16')
+        row.pack(fill='x', pady=(0, 4))
+        ttk.Label(row, text='Формат найденного фото:', style='Muted.TLabel').pack(side='left', padx=(0, 8))
+        self.layout = tk.StringVar(value='Авто: 16:9 или 9:16')
+        self.combo(row, self.layout, list(LAYOUTS), 23).pack(side='left')
         self.effect = tk.StringVar(value='Появление снизу')
-        self.combo(row, self.layout, list(LAYOUTS), 22).pack(side='left')
-        self.combo(row, self.effect, list(EFFECTS), 24).pack(side='left', padx=5)
         self.names_on = tk.BooleanVar(value=True)
         check = ttk.Checkbutton(row, text='Имена при произнесении', variable=self.names_on)
-        check.pack(side='left', padx=6)
+        check.pack(side='left', padx=12)
         self.controls.append((check, 'normal'))
         self.button(row, 'Редактор имён и таймкодов', self.edit_names).pack(side='left')
-        check = ttk.Checkbutton(outer, text='Разрешить загрузку веб / YouTube-материалов, которые я вправе использовать',
-                                variable=self.external)
+        row = ttk.Frame(outer)
+        row.pack(fill='x')
+        ttk.Label(row, text='Появление фото:', style='Muted.TLabel').pack(side='left', padx=(0, 10))
+        for (label, _), color in zip(EFFECTS.items(), ('Blue', 'Purple', 'Green', 'Peach', 'Teal', 'Muted')):
+            choice = ttk.Radiobutton(row, text=label, variable=self.effect, value=label, style=color + '.TRadiobutton')
+            choice.pack(side='left', padx=(0, 14))
+            self.controls.append((choice, 'normal'))
+        self.external = tk.BooleanVar(value=False)
+        check = ttk.Checkbutton(outer, text='Загружать веб / YouTube-материалы, которые я вправе использовать', variable=self.external)
         check.pack(anchor='w')
         self.controls.append((check, 'normal'))
+        activity = ttk.Frame(outer)
+        activity.pack(fill='x', pady=(6, 4))
+        ttk.Label(activity, text='Сейчас:', style='Muted.TLabel').pack(side='left')
+        self.status = ttk.Label(activity, text='Готов к работе', style='Activity.TLabel')
+        self.status.pack(side='left', padx=10)
+        self.stop_button = ttk.Button(activity, text='Остановить подбор', command=self.stop.set, state='disabled')
+        self.stop_button.pack(side='right')
+        self.stop_button.pack_forget()
+        self.progress = ttk.Progressbar(outer, mode='indeterminate', maximum=100)
+        self.progress.pack(fill='x', pady=(0, 12))
+        self.log_box = tk.Text(outer, height=3, state='disabled', wrap='word', bg='#181825', fg=theme.GREEN,
+                               insertbackground=theme.TEXT, relief='flat', padx=10, pady=8,
+                               highlightthickness=1, highlightbackground=theme.PANEL)
+        self.log_box.pack(side='bottom', fill='x', pady=(4, 0))
+        self.log_box.tag_configure('error', foreground=theme.RED)
+        self.log_box.tag_configure('info', foreground=theme.GREEN)
+        ttk.Label(outer, text='Журнал работы', style='Heading.TLabel').pack(side='bottom', anchor='w', pady=(8, 4))
         body = ttk.Panedwindow(outer, orient='horizontal')
-        body.pack(fill='both', expand=True, pady=8)
-        left, right = ttk.Frame(body), ttk.Frame(body, padding=(12, 0))
+        body.pack(fill='both', expand=True)
+        left, right = ttk.Frame(body, width=410), ttk.Frame(body, padding=(16, 0, 0, 0))
         body.add(left, weight=1)
         body.add(right, weight=2)
-        self.tree = ttk.Treeview(left, columns=('time', 'kind', 'status', 'text'), show='headings', selectmode='browse')
-        for key, text, width in [('time', 'Начало', 60), ('kind', 'План', 80), ('status', 'Файл', 55), ('text', 'Озвучка', 220)]:
+        ttk.Label(left, text='Сцены рассказа', style='Heading.TLabel').pack(anchor='w', pady=(0, 8))
+        tree_frame = ttk.Frame(left)
+        tree_frame.pack(fill='both', expand=True)
+        self.tree = ttk.Treeview(tree_frame, columns=('time', 'kind', 'status', 'text'), show='headings', selectmode='browse')
+        for key, text, width in [('time', 'Время', 115), ('kind', 'Источник', 100), ('status', 'Файл', 65), ('text', 'Озвучка', 225)]:
             self.tree.heading(key, text=text)
             self.tree.column(key, width=width, stretch=key == 'text')
-        scrollbar = ttk.Scrollbar(left, command=self.tree.yview)
+        self.tree.tag_configure('ready', foreground=theme.GREEN)
+        self.tree.tag_configure('pending', foreground=theme.TEXT)
+        scrollbar = ttk.Scrollbar(tree_frame, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side='right', fill='y')
         self.tree.pack(fill='both', expand=True)
         self.tree.bind('<<TreeviewSelect>>', self.select_scene)
-        self.scene_label = ttk.Label(right, text='Выберите сцену', wraplength=590)
-        self.scene_label.pack(fill='x', pady=5)
-        self.file_label = ttk.Label(right, text='', wraplength=590)
-        self.file_label.pack(fill='x')
-        row = ttk.Frame(right)
-        row.pack(fill='x', pady=7)
+        ttk.Label(right, text='Выбранная сцена', style='Heading.TLabel').pack(anchor='w', pady=(0, 8))
+        self.scene_label = ttk.Label(right, text='Откройте озвучку и выберите сцену слева.', wraplength=740, style='Scene.TLabel')
+        self.scene_label.pack(fill='x')
+        self.file_label = ttk.Label(right, text='Материал не назначен', wraplength=740, style='Success.TLabel')
+        self.file_label.pack(fill='x', pady=(8, 2))
+        tabs = ttk.Notebook(right)
+        tabs.pack(fill='both', expand=True, pady=(4, 0))
+        variants = ttk.Frame(tabs, padding=(0, 6))
+        clips = ttk.Frame(tabs, padding=10)
+        tabs.add(variants, text='Варианты')
+        tabs.add(clips, text='Клип и ссылки')
+        row = ttk.Frame(variants)
+        row.grid(row=0, column=0, sticky='ew', pady=5)
+        variants.columnconfigure(0, weight=1)
+        variants.rowconfigure(2, weight=1)
         self.kind = tk.StringVar(value='Фото')
-        self.combo(row, self.kind, list(KINDS), 18).pack(side='left')
+        self.combo(row, self.kind, list(KINDS), 17).pack(side='left')
         self.query = tk.StringVar()
         entry = ttk.Entry(row, textvariable=self.query)
         entry.pack(side='left', fill='x', expand=True, padx=5)
         self.controls.append((entry, 'normal'))
-        self.button(row, 'Найти', self.search).pack(side='left')
-        ttk.Label(right, text='Запрос можно задать вручную; пустое поле — подбор по смыслу.', wraplength=590).pack(anchor='w')
-        self.candidates = ttk.Treeview(right, columns=('provider', 'score', 'title'), show='headings', height=5, selectmode='browse')
-        self.candidates.heading('provider', text='Источник')
-        self.candidates.heading('title', text='Название / запрос')
-        self.candidates.heading('score', text='Смысл')
-        self.candidates.column('score', width=55, stretch=False)
-        self.candidates.column('provider', width=95, stretch=False)
-        self.candidates.column('title', width=350)
-        self.candidates.pack(fill='x', pady=8)
+        self.button(row, 'Найти варианты', self.search, 'Blue').pack(side='left')
+        ttk.Label(variants, text='Варианты по смыслу · нажмите карточку, чтобы выбрать', style='Muted.TLabel').grid(row=1, column=0, sticky='w', pady=(5, 4))
+        # The hidden tree keeps a stable selection model for keyboard/action callbacks.
+        self.candidates = ttk.Treeview(right, columns=('provider', 'score', 'title'), show='headings', selectmode='browse')
         self.candidates.bind('<<TreeviewSelect>>', self.select_candidate)
-        self.preview = ttk.Label(right, text='Превью')
-        self.preview.pack(anchor='w')
-        row = ttk.Frame(right)
-        row.pack(fill='x', pady=5)
-        ttk.Label(row, text='Начало клипа, сек:').pack(side='left')
+        self.cards_canvas = tk.Canvas(variants, height=194, bg=theme.BG, highlightthickness=0)
+        self.cards_canvas.grid(row=2, column=0, sticky='nsew')
+        self.cards_frame = ttk.Frame(self.cards_canvas)
+        self.cards_window = self.cards_canvas.create_window((0, 0), window=self.cards_frame, anchor='nw')
+        self.cards_frame.bind('<Configure>', lambda event: self.cards_canvas.configure(scrollregion=self.cards_canvas.bbox('all')))
+        scroll = ttk.Scrollbar(variants, orient='horizontal', command=self.cards_canvas.xview)
+        scroll.grid(row=3, column=0, sticky='ew', pady=(0, 6))
+        self.cards_canvas.configure(xscrollcommand=scroll.set)
+        self.cards_canvas.bind('<Configure>', self.resize_cards)
+        right.bind('<Configure>', lambda event: self.scene_label.configure(wraplength=max(260, event.width - 40)))
+        self.preview = ttk.Label(variants)  # Compatibility with existing preview callbacks; cards show the images.
+        row = ttk.Frame(variants)
+        row.grid(row=4, column=0, sticky='ew', pady=3)
+        self.action_buttons = [self.button(row, 'Назначить выбранное', self.assign_candidate, 'Green'),
+            self.button(row, 'Открыть источник', self.open_source),
+            self.button(row, 'Свой файл', self.local_file),
+            self.button(row, 'Превью сцены', self.preview_scene, 'Purple')]
+        for i, button in enumerate(self.action_buttons):
+            button.grid(row=0, column=i, padx=(0, 5), pady=2, sticky='ew')
+        row.bind('<Configure>', self.resize_actions)
+        row = ttk.Frame(clips)
+        row.pack(fill='x', pady=3)
+        ttk.Label(row, text='Начало клипа, сек:', style='Muted.TLabel').pack(side='left')
         self.source_start = tk.StringVar(value='0')
-        entry = ttk.Entry(row, textvariable=self.source_start, width=9)
+        entry = ttk.Entry(row, textvariable=self.source_start, width=8)
         entry.pack(side='left', padx=5)
         self.controls.append((entry, 'normal'))
         self.button(row, 'Таймкод по субтитрам', self.find_start).pack(side='left')
-        self.match_label = ttk.Label(right, text='', wraplength=590)
+        self.button(row, 'Сохранить начало', self.save_offset).pack(side='left', padx=5)
+        self.match_label = ttk.Label(clips, text='', wraplength=740, style='Muted.TLabel')
         self.match_label.pack(fill='x')
-        row = ttk.Frame(right)
-        row.pack(fill='x', pady=6)
-        self.button(row, 'Назначить найденное', self.assign_candidate).pack(side='left')
-        self.button(row, 'Открыть источник', self.open_source).pack(side='left', padx=5)
-        self.button(row, 'Свой файл', self.local_file).pack(side='left')
-        row = ttk.Frame(right)
-        row.pack(fill='x', pady=5)
+        row = ttk.Frame(clips)
+        row.pack(fill='x', pady=3)
         self.url = tk.StringVar()
         entry = ttk.Entry(row, textvariable=self.url)
         entry.pack(side='left', fill='x', expand=True)
         self.controls.append((entry, 'normal'))
         self.button(row, 'Добавить ссылку на видео', self.add_url).pack(side='left', padx=5)
-        row = ttk.Frame(right)
-        row.pack(fill='x', pady=4)
-        self.button(row, 'Сохранить начало', self.save_offset).pack(side='left')
-        self.button(row, 'Снять назначение', self.clear_scene).pack(side='left', padx=5)
-        self.button(row, 'Открыть файл', self.play_file).pack(side='left')
-        self.button(row, 'Стиль сцены', self.scene_style).pack(side='left', padx=5)
-        bottom = ttk.Frame(outer)
-        bottom.pack(fill='x')
-        self.button(bottom, 'Подобрать все пустые сцены', self.auto_pick).pack(side='left')
-        self.stop_button = ttk.Button(bottom, text='Остановить подбор', command=self.stop.set, state='disabled')
-        self.stop_button.pack(side='left', padx=6)
-        self.button(bottom, 'Собрать видео', self.render).pack(side='left')
-        self.button(bottom, 'Превью сцены', self.preview_scene).pack(side='left', padx=5)
-        self.status = ttk.Label(bottom, text='Готов к работе')
-        self.status.pack(side='left', padx=10)
-        self.log_box = tk.Text(outer, height=6, state='disabled', wrap='word')
-        self.log_box.pack(fill='x', pady=(8, 0))
+        row = ttk.Frame(clips)
+        row.pack(fill='x', pady=3)
+        self.button(row, 'Снять назначение', self.clear_scene).pack(side='left')
+        self.button(row, 'Открыть файл', self.play_file).pack(side='left', padx=5)
+        self.button(row, 'Стиль сцены', self.scene_style, 'Peach').pack(side='left')
+        export_settings = ttk.LabelFrame(clips, text='Настройки готового видео', padding=10)
+        export_settings.pack(fill='x', pady=(14, 0))
+        self.combo(export_settings, self.resolution, ['1280×720', '1920×1080', '720×1280'], 13).pack(side='left')
+        ttk.Label(export_settings, text='Затемнение, сек:').pack(side='left', padx=(10, 3))
+        entry = ttk.Entry(export_settings, textvariable=self.fade, width=4)
+        entry.pack(side='left', padx=4)
+        self.controls.append((entry, 'normal'))
+        check = ttk.Checkbutton(export_settings, text='Субтитры', variable=self.burn_subs)
+        check.pack(side='left', padx=8)
+        self.controls.append((check, 'normal'))
+        self.clear_cards()
         self.root.after(100, self.poll)
 
-    def button(self, parent, text, command):
+    def button(self, parent, text, command, color=None):
         def guarded():
             if self.busy:
                 return
@@ -191,7 +250,7 @@ class App:
                 command()
             except Exception as exc:
                 self.message.showerror('Ошибка', str(exc))
-        widget = self.ttk.Button(parent, text=text, command=guarded)
+        widget = self.ttk.Button(parent, text=text, command=guarded, width=0, style=color + '.TButton' if color else 'TButton')
         self.controls.append((widget, 'normal'))
         return widget
 
@@ -209,14 +268,18 @@ class App:
                 kind, payload = self.events.get_nowait()
                 if kind == 'log':
                     self.log_box.config(state='normal')
-                    self.log_box.insert('end', payload + '\n')
+                    tag = 'error' if any(t in payload.lower() for t in ('ошибк', 'http ', 'не удалось', 'не выдала')) else 'info'
+                    self.log_box.insert('end', payload + '\n', tag)
                     self.log_box.see('end')
                     self.log_box.config(state='disabled')
                 elif kind == 'done':
                     self.busy = False
+                    self.progress.stop()
+                    self.progress.configure(value=0)
                     for widget, state in self.controls:
                         widget.configure(state=state)
                     self.stop_button.configure(state='disabled')
+                    self.stop_button.pack_forget()
                     self.refresh()
                     if payload:
                         payload()
@@ -228,6 +291,16 @@ class App:
                         from PIL import ImageTk
                         self.preview_ref = ImageTk.PhotoImage(image)
                         self.preview.configure(image=self.preview_ref, text='')
+                elif kind == 'card_image':
+                    generation, index, image = payload
+                    if generation == self.card_generation and index in self.card_widgets:
+                        self.card_originals[index] = image
+                        self.paint_card(index)
+                        self.card_widgets[index]['image'].delete('placeholder')
+                elif kind == 'card_unavailable':
+                    generation, index = payload
+                    if generation == self.card_generation and index in self.card_widgets:
+                        self.card_widgets[index]['image'].itemconfigure('placeholder', text='Превью недоступно')
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
@@ -238,10 +311,12 @@ class App:
         self.busy = True
         self.stop.clear()
         self.status.configure(text=label)
+        self.progress.start(15)
         for widget, _ in self.controls:
             widget.configure(state='disabled')
         if stoppable:
             self.stop_button.configure(state='normal')
+            self.stop_button.pack(side='right')
         def work():
             success = False
             try:
@@ -292,6 +367,7 @@ class App:
         self.scene_label.configure(text='Выберите сцену')
         self.file_label.configure(text='')
         self.candidates.delete(*self.candidates.get_children())
+        self.clear_cards()
         self.preview.configure(image='', text='Превью')
         self.refresh()
 
@@ -303,6 +379,7 @@ class App:
             self.scene_label.configure(text='Выберите сцену')
             self.file_label.configure(text='')
             self.candidates.delete(*self.candidates.get_children())
+            self.clear_cards()
         desired_ids = [str(i) for i in range(len(self.project.segments))]
         if list(self.tree.get_children()) != desired_ids:
             self.tree.delete(*self.tree.get_children())
@@ -310,18 +387,21 @@ class App:
         for i, seg in enumerate(self.project.segments):
             has_file = bool(seg.get('footage_path') and Path(seg['footage_path']).is_file())
             done += has_file
-            values = (f"{seg['start']:.1f}", LABELS.get(seg.get('desired_kind'), '?'),
+            values = (timecode(seg['start']), LABELS.get(seg.get('desired_kind'), '?'),
                       '✓' if has_file else '—', seg['text'])
             if self.tree.exists(str(i)):
-                self.tree.item(str(i), values=values)
+                self.tree.item(str(i), values=values, tags=('ready' if has_file else 'pending',))
             else:
-                self.tree.insert('', 'end', iid=str(i), values=values)
+                self.tree.insert('', 'end', iid=str(i), values=values, tags=('ready' if has_file else 'pending',))
         self.status.configure(text=f'Назначено {done}/{len(self.project.segments)}')
+        self.transcript_status.configure(text=f'Транскрипция: {len(self.project.segments)} сцен')
+        self.media_status.configure(text=f'Материалы: {done}/{len(self.project.segments)} назначено')
         if self.selected is not None and self.selected < len(self.project.segments):
             if self.tree.selection() != (str(self.selected),):
                 self.tree.selection_set(str(self.selected))
             seg = self.project.segments[self.selected]
             self.file_label.configure(text=f"Файл: {seg.get('footage_path') or 'не назначен'}")
+        self.update_card_selection()
 
     def import_subtitles(self):
         self.settings()
@@ -378,7 +458,7 @@ class App:
         self.selected = int(selection[0])
         seg = self.require_scene()
         self.candidate = None
-        self.scene_label.configure(text=f"Сцена {self.selected + 1} · {seg['start']:.2f}–{seg['end']:.2f}с\n{seg['text']}")
+        self.scene_label.configure(text=f"Сцена {self.selected + 1} · {timecode(seg['start'])} → {timecode(seg['end'])}\n{seg['text']}")
         self.file_label.configure(text=f"Файл: {seg.get('footage_path') or 'не назначен'}")
         self.kind.set(LABELS.get(seg.get('desired_kind'), 'По смыслу'))
         self.query.set(seg.get('search_query', ''))
@@ -392,10 +472,135 @@ class App:
     def fill_candidates(self):
         seg = self.require_scene()
         self.candidates.delete(*self.candidates.get_children())
+        self.candidate = None
+        self.clear_cards(empty=not seg.get('candidates'))
+        generation = self.card_generation
+        thumbnails = []
         for i, candidate in enumerate(seg.get('candidates', [])):
             score = candidate.get('relevance_score')
             self.candidates.insert('', 'end', iid=str(i), values=(candidate['provider'],
                 f'{score:.0%}' if score is not None else '—', candidate.get('title') or candidate.get('query', '')))
+            colors = self.colors
+            cell = self.tk.Frame(self.cards_frame, bg=colors.CARD, highlightthickness=2,
+                                 highlightbackground=colors.PANEL)
+            cell.pack(side='left', padx=(0, 10), pady=2)
+            image = self.tk.Canvas(cell, width=200, height=100, bg=colors.PANEL, highlightthickness=0, cursor='hand2')
+            image.pack(padx=3, pady=3)
+            image.create_text(100, 50, text='Загрузка превью…' if candidate.get('preview_image') else 'Без превью',
+                              fill=colors.MUTED, tags='placeholder')
+            provider = candidate['provider']
+            color = {'youtube': colors.RED, 'pexels': colors.GREEN, 'pixabay': colors.TEAL,
+                     'web': colors.PURPLE, 'webvideo': colors.PURPLE}.get(provider, colors.BLUE)
+            badge = provider + (f' · смысл {score:.0%}' if score is not None else '')
+            self.tk.Label(cell, text=badge, bg=colors.CARD, fg=color, font=('Arial', 10, 'bold')).pack(anchor='w', padx=6)
+            title = candidate.get('title') or candidate.get('query') or 'Материал'
+            title_label = self.tk.Label(cell, text=title[:74], bg=colors.CARD, fg=colors.TEXT, wraplength=195,
+                          height=2, anchor='w', justify='left', font=('Arial', 10))
+            title_label.pack(fill='x', padx=6)
+            button = self.button(cell, 'Выбрать', lambda index=i: self.choose_card(index))
+            button.configure(padding=(6, 3))
+            button.pack(fill='x', padx=4, pady=(2, 4))
+            image.bind('<Button-1>', lambda event, index=i: self.choose_card(index))
+            self.card_widgets[i] = {'cell': cell, 'image': image, 'button': button, 'title': title_label}
+            if candidate.get('preview_image'):
+                thumbnails.append((i, candidate['preview_image']))
+        self.update_card_selection()
+        self.root.after_idle(self.resize_cards)
+        if thumbnails:
+            def download_all():
+                from concurrent.futures import ThreadPoolExecutor
+                def download(item):
+                    if generation != self.card_generation:
+                        return
+                    index, url = item
+                    try:
+                        import io
+                        from PIL import Image, ImageOps
+                        with media.requests.get(media.safe_url(url), timeout=(5, 12), stream=True) as response:
+                            response.raise_for_status()
+                            data = bytearray()
+                            for chunk in response.iter_content(65536):
+                                data.extend(chunk)
+                                if len(data) > 12 * 1024 * 1024:
+                                    raise ValueError('Preview too large')
+                        with Image.open(io.BytesIO(data)) as original:
+                            thumbnail = ImageOps.pad(ImageOps.exif_transpose(original).convert('RGB'),
+                                                     (200, 100), color=self.colors.PANEL)
+                            self.events.put(('card_image', (generation, index, thumbnail)))
+                    except Exception:
+                        self.events.put(('card_unavailable', (generation, index)))
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    list(pool.map(download, thumbnails))
+            threading.Thread(target=download_all, daemon=True).start()
+
+    def clear_cards(self, empty=True):
+        self.card_generation += 1
+        old_buttons = {c['button'] for c in self.card_widgets.values()}
+        self.controls[:] = [(w, state) for w, state in self.controls if w not in old_buttons]
+        for child in self.cards_frame.winfo_children():
+            child.destroy()
+        self.card_widgets.clear()
+        self.card_images.clear()
+        self.card_originals.clear()
+        self.cards_canvas.xview_moveto(0)
+        if empty:
+            self.ttk.Label(self.cards_frame, text='Здесь появятся фото и видео для выбранной сцены.\nНажмите «Найти варианты».',
+                           style='Muted.TLabel', padding=(20, 50)).pack()
+
+    def choose_card(self, index):
+        if not self.busy:
+            self.candidates.selection_set(str(index))
+            self.select_candidate()
+
+    def resize_cards(self, _event=None):
+        height = self.cards_canvas.winfo_height()
+        compact = height < 180
+        image_height = max(30, min(100, height - (48 if compact else 96)))
+        for index, widgets in self.card_widgets.items():
+            widgets['image'].configure(height=image_height)
+            widgets['image'].coords('placeholder', 100, image_height / 2)
+            widgets['title'].configure(height=1 if compact else 2)
+            if compact:
+                widgets['button'].pack_forget()
+            else:
+                widgets['button'].pack(fill='x', padx=4, pady=(2, 4))
+            self.paint_card(index)
+
+    def resize_toolbar(self, event):
+        widths = [widget.winfo_reqwidth() + 6 for widget in self.toolbar_items]
+        columns = next((n for n in (8, 4, 2) if max(sum(widths[i:i + n])
+                            for i in range(0, len(widths), n)) <= event.width), 2)
+        for i, widget in enumerate(self.toolbar_items):
+            widget.grid(row=i // columns, column=i % columns)
+
+    def resize_actions(self, event):
+        widths = [button.winfo_reqwidth() + 5 for button in self.action_buttons]
+        columns = 4 if sum(widths) <= event.width else 2 if max(sum(widths[:2]), sum(widths[2:])) <= event.width else 1
+        for i, button in enumerate(self.action_buttons):
+            button.grid(row=i // columns, column=i % columns)
+
+    def paint_card(self, index):
+        if index not in self.card_originals:
+            return
+        from PIL import ImageOps, ImageTk
+        canvas = self.card_widgets[index]['image']
+        height = int(canvas.cget('height'))
+        thumbnail = ImageOps.pad(self.card_originals[index], (200, height), color=self.colors.PANEL)
+        self.card_images[index] = ImageTk.PhotoImage(thumbnail)
+        canvas.delete('thumbnail')
+        canvas.create_image(100, height / 2, image=self.card_images[index], tags='thumbnail')
+
+    def update_card_selection(self):
+        assigned = self.require_scene().get('selected_candidate_id') if self.project and self.selected is not None else None
+        for index, widgets in self.card_widgets.items():
+            candidates = self.require_scene().get('candidates', [])
+            if index >= len(candidates):
+                continue
+            candidate = candidates[index]
+            chosen = self.candidate is candidate
+            ready = candidate.get('id') == assigned
+            widgets['cell'].configure(highlightbackground=self.colors.BLUE if chosen else self.colors.GREEN if ready else self.colors.PANEL)
+            widgets['button'].configure(text='Выбрано' if chosen else 'Назначено ✓' if ready else 'Выбрать')
 
     def select_candidate(self, _event=None):
         if self.busy:
@@ -404,25 +609,11 @@ class App:
         if not selection:
             return
         candidate = self.require_scene()['candidates'][int(selection[0])]
-        self.candidate = candidate
-        self.source_start.set('0')
-        self.preview.configure(image='', text='Превью недоступно')
-        url = candidate.get('preview_image')
-        if not url:
+        if self.candidate is candidate:
             return
-        def work():
-            try:
-                import io
-                from PIL import Image, ImageOps
-                response = media.requests.get(media.safe_url(url), timeout=12)
-                response.raise_for_status()
-                with Image.open(io.BytesIO(response.content)) as image:
-                    image = ImageOps.exif_transpose(image).convert('RGB')
-                    image.thumbnail((360, 160))
-                    self.events.put(('preview', (candidate['id'], image.copy())))
-            except Exception:
-                pass
-        threading.Thread(target=work, daemon=True).start()
+        self.candidate = candidate
+        self.update_card_selection()
+        self.source_start.set('0')
 
     def search(self):
         seg = self.require_scene()
@@ -567,6 +758,7 @@ class App:
         path = Path(__file__).with_name('.env')
         values = dotenv_values(path) if path.exists() else {}
         win = self.tk.Toplevel(self.root)
+        win.configure(bg=self.colors.BG)
         win.title('API-ключи — хранятся локально в .env')
         win.transient(self.root)
         win.grab_set()
@@ -578,8 +770,31 @@ class App:
             variable = self.tk.StringVar(value=values.get(key) or os.getenv(key, ''))
             variables[key] = variable
             self.ttk.Entry(frame, textvariable=variable, show='•', width=44).grid(row=i, column=1, padx=8, pady=5)
-        self.ttk.Label(frame, text='Fast-gen: план и транскрибация. Pexels/Pixabay: только стоки.\n'
-                       'Ключи не отправляются в GitHub и не выводятся в журнал.').grid(row=3, column=0, columnspan=2, pady=8)
+        self.ttk.Label(frame, text='Текстовая модель').grid(row=3, column=0, sticky='w', pady=5)
+        model = self.tk.StringVar(value=values.get('FASTGEN_TEXT_MODEL') or os.getenv('FASTGEN_TEXT_MODEL', ''))
+        variables['FASTGEN_TEXT_MODEL'] = model
+        models = self.ttk.Combobox(frame, textvariable=model, width=41)
+        models.grid(row=3, column=1, padx=8, pady=5)
+        model_result = {}
+        def fetch_models():
+            import fastgen_text
+            key = variables['FASTGEN_API_KEY'].get().strip()
+            if not key:
+                self.message.showerror('Нет ключа', 'Введите ключ Fast-gen в поле выше.', parent=win)
+                return
+            def work():
+                model_result['models'] = fastgen_text.available_models(api_key=key)
+            def done():
+                if win.winfo_exists():
+                    models.configure(values=model_result['models'])
+                    if not model.get():
+                        model.set(model_result['models'][0])
+                    models.focus_set()
+            self.task('Получаю список текстовых моделей…', work, done)
+        self.ttk.Button(frame, text='Получить список моделей', command=fetch_models).grid(row=4, column=1, sticky='w', padx=8)
+        self.ttk.Label(frame, text='Пустая модель — автоматический выбор из доступных в вашем аккаунте.\n'
+                       'Можно выбрать из списка или вписать ID текстовой модели Fast-gen.\n'
+                       'Ключи хранятся локально; значения скрыты в журнале и GitHub.').grid(row=5, column=0, columnspan=2, pady=12)
         def save():
             if not path.exists():
                 path.touch(mode=0o600)
@@ -594,7 +809,7 @@ class App:
                 path.chmod(0o600)
             self.log('Настройки ключей сохранены локально. Значения скрыты.')
             win.destroy()
-        self.ttk.Button(frame, text='Сохранить', command=save).grid(row=4, column=1, sticky='e')
+        self.ttk.Button(frame, text='Сохранить', command=save, style='Green.TButton').grid(row=6, column=1, sticky='e')
 
     def scene_style(self):
         seg = self.require_scene()
@@ -609,7 +824,7 @@ class App:
         self.ttk.Combobox(frame, textvariable=layout, values=list(LAYOUTS), state='readonly', width=28).pack(pady=5)
         self.ttk.Combobox(frame, textvariable=effect, values=list(EFFECTS), state='readonly', width=28).pack(pady=5)
         def save():
-            seg.update(photo_layout=LAYOUTS[layout.get()], effect=EFFECTS[effect.get()])
+            seg.update(photo_layout=LAYOUTS[layout.get()], photo_layout_manual=True, effect=EFFECTS[effect.get()])
             self.project.save()
             win.destroy()
         self.ttk.Button(frame, text='Сохранить для этой сцены', command=save).pack(pady=5)
