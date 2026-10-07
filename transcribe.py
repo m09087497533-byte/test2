@@ -12,6 +12,7 @@ import base64
 import mimetypes
 import urllib.request
 from pathlib import Path
+from project import normalize_segment_timing
 
 
 FASTGEN_API_KEY = os.getenv("FASTGEN_API_KEY")
@@ -100,9 +101,13 @@ def split_into_scenes(segments: list[dict], max_duration: float = 8.0, min_durat
     подобрать свой футаж, а не один на весь текст.
     """
     scenes = []
+    segments, _ = normalize_segment_timing(segments)
     for seg in segments:
+        if seg.get('words') and all(w.get('start') is not None and w.get('end') is not None for w in seg['words']):
+            from planner import timed_words
+            seg['words'] = timed_words([seg])
         scenes.extend(_split_segment_into_scenes(seg, max_duration, min_duration))
-    return scenes
+    return normalize_segment_timing(scenes)[0]
 
 
 def transcribe_audio(audio_path: Path, language_codes=None, progress_cb=None, split_scenes=True) -> dict:
@@ -174,6 +179,9 @@ def transcribe_audio(audio_path: Path, language_codes=None, progress_cb=None, sp
             ]
             for seg in segments:
                 seg['timing_quality'] = 'word' if seg['words'] else 'estimated'
+            segments, repairs = normalize_segment_timing(segments)
+            if repairs:
+                report(f'Пересечения границ исправлены автоматически: {repairs}.')
             scenes = split_into_scenes(segments) if split_scenes else segments
             report(f"Разбито на {len(scenes)} сцен (было {len(segments)} сегмент(ов) от API)")
             return {"text": result.get("text") or "", "segments": scenes}

@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from project import media_kind, validate_segments
+from project import media_kind, normalize_segment_timing
 from subtitles import write_srt
 from titles import write_name_ass
 
@@ -101,7 +101,7 @@ def duration(path):
 
 
 def timeline(segments, audio_duration, fps):
-    validate_segments(segments)
+    segments, _ = normalize_segment_timing(segments)
     if segments[-1]['end'] > audio_duration + 0.15:
         raise ValueError('Субтитры выходят за конец аудио. Проверьте, что выбрана правильная озвучка.')
     total_frames = math.ceil(audio_duration * fps)
@@ -196,6 +196,9 @@ def build_video(segments, audio_path, output_path, settings=None, log_fn=print, 
     if not any(s['codec_type'] == 'audio' for s in audio_info['streams']):
         raise ValueError('В выбранном файле нет аудиодорожки')
     audio_duration = duration(audio_path)
+    segments, repairs = normalize_segment_timing(segments)
+    if repairs:
+        log_fn(f'Пересечения сцен исправлены автоматически: {repairs}.')
     items = timeline(segments, audio_duration, fps)
     missing = [i + 1 for i, s in enumerate(items) if not s.get('footage_path') or not Path(s['footage_path']).is_file()]
     if missing:

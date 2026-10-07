@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from fastgen_text import json_object
-from project import validate_segments
+from project import normalize_segment_timing, validate_segments
 
 EFFECTS = ('slide_up', 'slide_left', 'pop', 'fade', 'slow_zoom', 'none')
 DEFAULTS = {'min_scene': 6.0, 'photo_max': 14.0, 'video_max': 8.0}
@@ -26,6 +26,17 @@ def timed_words(segments):
         words = seg.get('words') or []
         exact = bool(words) and all(w.get('start') is not None and w.get('end') is not None for w in words)
         if exact:
+            for word in words:
+                start, end = float(word['start']), float(word['end'])
+                if not all(math.isfinite(v) for v in (start, end)) or start < 0 or end < start:
+                    raise ValueError('Неверные таймкоды слов')
+        if exact and seg.get('timing_repaired') and any(
+            float(w['start']) < float(seg['start']) or float(w['start']) >= float(seg['end']) for w in words
+        ):
+            # Simultaneous/overlapping cues can leave words outside the repaired
+            # interval. Estimate that cue explicitly; do not reorder its narration.
+            exact = False
+        if exact:
             words = copy.deepcopy(words)
         else:
             text = seg['text'].split()
@@ -33,12 +44,30 @@ def timed_words(segments):
             words = [{'text': t, 'start': seg['start'] + i * step,
                       'end': seg['start'] + (i + 1) * step} for i, t in enumerate(text)]
         for word in words:
-            if not math.isfinite(float(word['start'])) or not math.isfinite(float(word['end'])):
+            word['timing_quality'] = seg.get('timing_quality', 'word') if exact else 'estimated'
+            word['start'], word['end'] = float(word['start']), float(word['end'])
+            if not math.isfinite(word['start']) or not math.isfinite(word['end']):
                 raise ValueError('Неверные таймкоды слов')
-            if word['end'] <= word['start']:
-                continue
-            word['timing_quality'] = seg.get('timing_quality', 'word' if exact else 'estimated')
+            # Zero-length words are common in recognizer output. Keep their text
+            # and fit them with adjacent words instead of silently dropping them.
+            if word['start'] < 0 or word['end'] < word['start']:
+                raise ValueError('Неверные таймкоды слов')
+            if result and word['start'] < result[-1]['start']:
+                if result[-1]['start'] - word['start'] > 0.05:
+                    raise ValueError('Таймкоды слов идут назад: неверные данные транскрипции.')
+                word['start'] = result[-1]['start']
+                word['end'] = max(word['end'], word['start'])
+                word['timing_repaired'] = True
+                word['timing_quality'] = 'adjusted'
+            word['end'] = max(word['end'], word['start'] + 0.001)
             result.append(word)
+    if not result:
+        raise ValueError('В транскрипции нет слов для планирования.')
+    original_starts = [w['start'] for w in result]
+    result, _ = normalize_segment_timing(result)
+    for word, start in zip(result, original_starts):
+        if word['start'] != start:
+            word['timing_quality'] = 'adjusted'
     return result
 
 
@@ -94,7 +123,7 @@ def units_from_words(words):
     if current:
         units.append({'text': ' '.join(w['text'] for w in current), 'words': current,
                       'start': current[0]['start'], 'end': current[-1]['end']})
-    return units
+    return normalize_segment_timing(units)[0] if units else []
 
 
 def validate_groups(groups, count):
@@ -155,15 +184,21 @@ def rebalance_scenes(scenes, min_scene=6.0, photo_max=14.0, video_max=8.0):
             part.update(text=' '.join(w['text'] for w in words[lo:hi]), words=words[lo:hi],
                         start=words[lo]['start'], end=words[hi - 1]['end'])
             result.append(part)
+    result, _ = normalize_segment_timing(result)
     for i, scene in enumerate(result):
         scene['index'] = i
     return result
 
 
 def plan_story(segments, settings=None, log=print, cancelled=lambda: False):
-    validate_segments(segments)
+    segments, repairs = normalize_segment_timing(segments)
     settings = {**DEFAULTS, **(settings or {})}
     original = copy.deepcopy(segments)
+    # Check/repair word boundaries before spending requests on a long story.
+    words = timed_words(segments)
+    units = units_from_words(words)
+    if repairs or any(w.get('timing_repaired') for w in words):
+        log('Пересечения таймкодов исправлены автоматически; текст и озвучка сохранены.')
     full_text = ' '.join(s['text'] for s in segments)
     log('Читаю рассказ целиком: люди, события, места, эпоха…')
     overview_prompt = (
@@ -203,8 +238,6 @@ def plan_story(segments, settings=None, log=print, cancelled=lambda: False):
         not isinstance(e.get('aliases', []), list) or
         any(not isinstance(a, str) for a in e.get('aliases', [])) for e in overview.get('entities', [])):
         raise ValueError('Некорректный список имён в плане')
-    words = timed_words(segments)
-    units = units_from_words(words)
     planned = []
     for offset in range(0, len(units), 32):
         if cancelled():
@@ -260,12 +293,13 @@ def plan_story(segments, settings=None, log=print, cancelled=lambda: False):
 
 def save_plan(project, result):
     """Применяем целиком после успешной проверки; прошлый проект оставляем резервной копией."""
+    segments, _ = normalize_segment_timing(result['segments'])
     if project.project_file.exists():
         import datetime
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
         backup = project.project_dir / ('project.before-plan.' + stamp + '.json')
         backup.write_bytes(project.project_file.read_bytes())
-    project.segments = copy.deepcopy(result['segments'])
+    project.segments = segments
     project.story = result['story']
     project.name_titles = result['name_titles']
     project.raw_transcript = result['raw_transcript']

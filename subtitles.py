@@ -2,7 +2,7 @@
 import html
 import re
 from pathlib import Path
-from project import validate_segments
+from project import normalize_segment_timing
 
 TIME = re.compile(r'(?:(\d+):)?(\d{2}):(\d{2})[.,](\d{3})')
 
@@ -30,19 +30,23 @@ def import_subtitle_file(path, max_duration=None):
                 break
             if end <= start:
                 raise ValueError('Конец реплики должен быть позже начала')
-            words = text.split()
-            count = min(len(words), max(1, __import__('math').ceil((end - start) / max_duration))) if max_duration else 1
-            for j in range(count):
-                lo, hi = j * len(words) // count, (j + 1) * len(words) // count
-                segments.append({'text': ' '.join(words[lo:hi]),
-                                 'start': start + (end - start) * lo / len(words),
-                                 'end': start + (end - start) * hi / len(words),
-                                 'timing_quality': 'estimated',
-                                 'words': [{'text': words[k], 'start': start + (end - start) * k / len(words),
-                                            'end': start + (end - start) * (k + 1) / len(words)} for k in range(lo, hi)]})
+            segments.append({'text': text, 'start': start, 'end': end})
             break
-    validate_segments(segments)
-    return {'text': ' '.join(s['text'] for s in segments), 'segments': segments}
+    segments, repairs = normalize_segment_timing(segments)
+    result = []
+    for seg in segments:
+        start, end, words = seg['start'], seg['end'], seg['text'].split()
+        count = min(len(words), max(1, __import__('math').ceil((end - start) / max_duration))) if max_duration else 1
+        for j in range(count):
+            lo, hi = j * len(words) // count, (j + 1) * len(words) // count
+            result.append({**seg, 'text': ' '.join(words[lo:hi]),
+                           'start': start + (end - start) * lo / len(words),
+                           'end': start + (end - start) * hi / len(words),
+                           'timing_quality': 'estimated',
+                           'words': [{'text': words[k], 'start': start + (end - start) * k / len(words),
+                                      'end': start + (end - start) * (k + 1) / len(words)} for k in range(lo, hi)]})
+    segments = result
+    return {'text': ' '.join(s['text'] for s in segments), 'segments': segments, 'timing_repairs': repairs}
 
 
 def timestamp(value):

@@ -57,6 +57,24 @@ class GuiTests(unittest.TestCase):
             showerror.assert_called_once()
         self.assertTrue(all(str(widget['state']) == state for widget, state in self.app.controls))
 
+    def test_open_old_project_repairs_overlap_without_popup_or_losing_media(self):
+        from PIL import Image
+        photo = Path(self.tmp.name) / 'ready.png'
+        Image.new('RGB', (160, 90), 'green').save(photo)
+        project = self.app.project
+        project.segments = [{'text': 'one', 'start': 0, 'end': 4.2, 'footage_path': str(photo)},
+                            {'text': 'two', 'start': 4, 'end': 8, 'footage_path': str(photo)}]
+        project.save()
+        with patch.object(self.app.dialog, 'askopenfilename', return_value=str(project.audio_path)), \
+             patch.object(self.app.message, 'showerror') as error:
+            self.app.pick_audio()
+            self.root.update()
+        error.assert_not_called()
+        self.assertEqual(self.app.project.segments[0]['end'], 4)
+        self.assertEqual(len(self.app.tree.get_children()), 2)
+        self.assertTrue(all(s['footage_path'] == str(photo) for s in self.app.project.segments))
+        self.assertTrue(list(project.project_dir.glob('project.before-timing.*.json')))
+
     def test_cards_keep_selection_and_discard_previous_scene_thumbnail(self):
         from PIL import Image
         self.app.project.segments[0]['candidates'] = [

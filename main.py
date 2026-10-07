@@ -92,7 +92,7 @@ class App:
         self.card_widgets = {}
         self.card_images = {}
         self.card_originals = {}
-        root.title('SceneMix 3.1 — автоматический подбор · монтаж по рассказу')
+        root.title('SceneMix 3.2 — автоматический подбор · монтаж по рассказу')
         root.geometry(f'{min(1440, root.winfo_screenwidth() - 60)}x{min(960, root.winfo_screenheight() - 80)}')
         root.minsize(1080, 780)
         root.protocol('WM_DELETE_WINDOW', self.close)
@@ -100,7 +100,7 @@ class App:
         outer.pack(fill='both', expand=True)
         top = ttk.Frame(outer)
         top.pack(fill='x', pady=(0, 12))
-        self.toolbar_items = [ttk.Label(top, text='SceneMix 3.1', style='Title.TLabel')]
+        self.toolbar_items = [ttk.Label(top, text='SceneMix 3.2', style='Title.TLabel')]
         for label, command, color in [('Аудио', self.pick_audio, 'Blue'),
                 ('Распознать', self.transcribe_audio, None), ('SRT / VTT', self.import_subtitles, None),
                 ('API-ключи', self.key_settings, None), ('Смысловой план', self.make_plan, 'Peach'),
@@ -401,6 +401,10 @@ class App:
         self.clear_cards()
         self.preview.configure(image='', text='Превью')
         self.refresh()
+
+        if project.timing_repair_count:
+            self.log(f'Таймкоды исправлены автоматически: {project.timing_repair_count}. '
+                     'Материалы сохранены; резервная копия — project.before-timing…json.')
 
     def refresh(self):
         if not self.project:
