@@ -18,7 +18,6 @@ import render
 import subtitles
 import transcribe
 import planner
-from search_policy import SearchPolicy
 from project import Project, PATTERNS
 
 KINDS = {'По смыслу': 'auto', 'Фото': 'photo', 'Стоки': 'stock', 'YouTube': 'youtube', 'Интернет-видео': 'web'}
@@ -35,6 +34,26 @@ def timecode(seconds):
     minutes, millis = divmod(millis, 60000)
     secs, millis = divmod(millis, 1000)
     return f'{hours:02}:{minutes:02}:{secs:02}.{millis:03}'
+
+
+def plan_and_pick(project, log=print, cancelled=lambda: False, progress=None):
+    """One action for both a new transcript and an existing partially filled project."""
+    if not project.story or any(s.get('desired_kind') == 'auto' for s in project.segments):
+        import copy
+        previous = copy.deepcopy(project.segments)
+        result = planner.plan_story(project.raw_transcript or project.segments,
+                                    project.settings, log, cancelled)
+        assignment_keys = ('footage_path', 'media_kind', 'source_start', 'footage_source', 'footage_query',
+                           'source_url', 'license_url', 'title', 'selected_candidate_id', 'asset_url',
+                           'original_source_start', 'source_clip_duration', 'photo_fingerprint', 'review_status')
+        for scene in result['segments']:
+            old = next((s for s in previous if s.get('footage_path') and Path(s['footage_path']).is_file()
+                        and s['text'] == scene['text'] and abs(s['start'] - scene['start']) < 0.001
+                        and abs(s['end'] - scene['end']) < 0.001), None)
+            if old:
+                scene.update({k: old[k] for k in assignment_keys if k in old})
+        planner.save_plan(project, result)
+    return media.auto_pick(project, log, cancelled, progress=progress)
 
 
 def doctor():
@@ -73,7 +92,7 @@ class App:
         self.card_widgets = {}
         self.card_images = {}
         self.card_originals = {}
-        root.title('SceneMix 3 — цветной редактор · монтаж по рассказу')
+        root.title('SceneMix 3.1 — автоматический подбор · монтаж по рассказу')
         root.geometry(f'{min(1440, root.winfo_screenwidth() - 60)}x{min(960, root.winfo_screenheight() - 80)}')
         root.minsize(1080, 780)
         root.protocol('WM_DELETE_WINDOW', self.close)
@@ -81,7 +100,7 @@ class App:
         outer.pack(fill='both', expand=True)
         top = ttk.Frame(outer)
         top.pack(fill='x', pady=(0, 12))
-        self.toolbar_items = [ttk.Label(top, text='SceneMix 3', style='Title.TLabel')]
+        self.toolbar_items = [ttk.Label(top, text='SceneMix 3.1', style='Title.TLabel')]
         for label, command, color in [('Аудио', self.pick_audio, 'Blue'),
                 ('Распознать', self.transcribe_audio, None), ('SRT / VTT', self.import_subtitles, None),
                 ('API-ключи', self.key_settings, None), ('Смысловой план', self.make_plan, 'Peach'),
@@ -181,8 +200,8 @@ class App:
         entry = ttk.Entry(row, textvariable=self.query)
         entry.pack(side='left', fill='x', expand=True, padx=5)
         self.controls.append((entry, 'normal'))
-        self.button(row, 'Найти варианты', self.search, 'Blue').pack(side='left')
-        ttk.Label(variants, text='Варианты по смыслу · нажмите карточку, чтобы выбрать', style='Muted.TLabel').grid(row=1, column=0, sticky='w', pady=(5, 4))
+        self.button(row, 'Найти и добавить', self.search, 'Blue').pack(side='left')
+        ttk.Label(variants, text='Лучший доступный вариант добавляется автоматически', style='Muted.TLabel').grid(row=1, column=0, sticky='w', pady=(5, 4))
         # The hidden tree keeps a stable selection model for keyboard/action callbacks.
         self.candidates = ttk.Treeview(right, columns=('provider', 'score', 'title'), show='headings', selectmode='browse')
         self.candidates.bind('<<TreeviewSelect>>', self.select_candidate)
@@ -285,6 +304,17 @@ class App:
                         payload()
                 elif kind == 'error':
                     self.message.showerror('Операция не завершена', payload)
+                elif kind == 'auto_progress':
+                    ready, total = payload
+                    self.media_status.configure(text=f'Материалы: {ready}/{total} назначено')
+                    self.status.configure(text=f'Автоматически заполнено: {ready}/{total}')
+                    self.progress.stop()
+                    self.progress.configure(mode='determinate', maximum=max(1, total), value=ready)
+                elif kind == 'render_phase':
+                    self.stop_button.configure(state='disabled')
+                    self.status.configure(text='Собираю видео…')
+                    self.progress.configure(mode='indeterminate', maximum=100, value=0)
+                    self.progress.start(15)
                 elif kind == 'preview':
                     token, image = payload
                     if self.candidate and token == self.candidate['id']:
@@ -311,6 +341,7 @@ class App:
         self.busy = True
         self.stop.clear()
         self.status.configure(text=label)
+        self.progress.configure(mode='indeterminate', maximum=100, value=0)
         self.progress.start(15)
         for widget, _ in self.controls:
             widget.configure(state='disabled')
@@ -321,7 +352,7 @@ class App:
             success = False
             try:
                 function()
-                success = True
+                success = not (stoppable and self.stop.is_set())
             except Exception as exc:
                 self.log(str(exc))
                 self.events.put(('error', str(exc)))
@@ -544,7 +575,7 @@ class App:
         self.card_originals.clear()
         self.cards_canvas.xview_moveto(0)
         if empty:
-            self.ttk.Label(self.cards_frame, text='Здесь появятся фото и видео для выбранной сцены.\nНажмите «Найти варианты».',
+            self.ttk.Label(self.cards_frame, text='Здесь появятся автоматически подобранные фото и видео.\nНажмите «Найти и добавить» или «Подобрать все».',
                            style='Muted.TLabel', padding=(20, 50)).pack()
 
     def choose_card(self, index):
@@ -617,21 +648,24 @@ class App:
 
     def search(self):
         seg = self.require_scene()
+        self.settings()
         project = self.project
         new_query = self.query.get().strip()
         if new_query != seg.get('search_query', ''):
             seg['manual_query'] = True
+            seg['candidates'] = []
+        if seg.get('desired_kind') != KINDS[self.kind.get()]:
+            seg['candidates'] = []
         seg.update(desired_kind=KINDS[self.kind.get()], search_query=new_query)
         project.save()
-        context = ' '.join(s['text'] for s in project.segments[max(0, self.selected - 1):self.selected + 2])
+        if seg['desired_kind'] == 'auto':
+            self.auto_pick()
+            return
+        index = self.selected
         def work():
-            candidates, warnings = media.search(seg, context=context, policy=SearchPolicy(project.project_dir))
-            seg['candidates'] = candidates
-            project.save()
-            for warning in warnings:
-                self.log(warning)
-            self.log(f'Найдено вариантов: {len(candidates)}')
-        self.task('Ищу…', work, self.fill_candidates)
+            media.auto_pick(project, self.log, self.stop.is_set, scene_indices=[index], replace_existing=True,
+                           progress=self.auto_progress)
+        self.task('Ищу и автоматически добавляю…', work, self.fill_candidates, stoppable=True)
 
     def add_url(self):
         seg = self.require_scene()
@@ -734,24 +768,27 @@ class App:
         if not self.project.segments:
             raise ValueError('Сначала импортируйте субтитры или транскрибируйте озвучку.')
         project = self.project
-        def work():
-            if not project.story and any(s.get('footage_path') for s in project.segments):
-                raise ValueError('Это проект без смыслового плана. Нажмите «Смысловой план», '
-                                 'чтобы пересобрать сцены; предыдущий проект сохранится резервной копией.')
-            if any(s.get('desired_kind') == 'auto' for s in project.segments):
-                result = planner.plan_story(project.raw_transcript or project.segments,
-                                            project.settings, self.log, self.stop.is_set)
-                planner.save_plan(project, result)
-            media.auto_pick(project, self.log, self.stop.is_set)
-        self.task('План и подбор…', work, done=self.select_scene, stoppable=True)
+        self.task('План и автоматический подбор…', lambda: plan_and_pick(project, self.log, self.stop.is_set, self.auto_progress),
+                  done=self.select_scene, stoppable=True)
+
+    def auto_progress(self, ready, total):
+        self.events.put(('auto_progress', (ready, total)))
 
     def render(self):
         self.settings()
         project = self.project
         output = project.project_dir / 'final_video.mp4'
-        self.task('Собираю…', lambda: render.build_video(project.segments, project.audio_path, output,
-                   project.settings, self.log, name_titles=project.name_titles),
-                  lambda: self.message.showinfo('Готово', f'Видео сохранено:\n{output}\n\nРядом: субтитры и список источников.'))
+        def work():
+            if any(not s.get('footage_path') or not Path(s['footage_path']).is_file() for s in project.segments):
+                plan_and_pick(project, self.log, self.stop.is_set, self.auto_progress)
+            if self.stop.is_set():
+                return
+            self.events.put(('render_phase', None))
+            render.build_video(project.segments, project.audio_path, output,
+                               project.settings, self.log, name_titles=project.name_titles)
+        self.task('Подготавливаю и собираю…', work,
+                  lambda: self.message.showinfo('Готово', f'Видео сохранено:\n{output}\n\nРядом: субтитры и список источников.'),
+                  stoppable=True)
 
     def key_settings(self):
         from dotenv import dotenv_values, set_key
@@ -942,7 +979,7 @@ def main():
         if not project.load():
             parser.error('Сохранённый проект не найден')
         if args.autopick:
-            media.auto_pick(project)
+            plan_and_pick(project)
             return 0 if all(s.get('footage_path') and Path(s['footage_path']).is_file() for s in project.segments) else 1
         render.build_video(project.segments, project.audio_path, project.project_dir / 'final_video.mp4',
                            project.settings, name_titles=project.name_titles)

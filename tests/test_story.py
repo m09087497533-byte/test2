@@ -92,15 +92,16 @@ class StoryTests(unittest.TestCase):
             self.assertEqual(fresh.call('Pexels', 'gymnast', function), [{'id': 'one'}])
             self.assertEqual(function.call_count, 1)
 
-    def test_unrelated_metadata_is_ranked_below_threshold(self):
+    def test_unrelated_metadata_is_ranked_below_person(self):
         c = [{'id': 'city', 'provider': 'pexels', 'title': 'Night street'},
              {'id': 'person', 'provider': 'web', 'title': 'Ольга Корбут 1972'}]
         with patch('planner.llm_json', return_value={'ranked': [
-            {'id': 'city', 'score': 0.05, 'reason': 'не тот сюжет'},
+            {'id': 'city', 'score': 0.05, 'compatible': False, 'reason': 'не тот сюжет'},
             {'id': 'person', 'score': 0.95, 'reason': 'тот человек'}]}):
             ranked = rank_candidates({'subject': 'Ольга Корбут'}, c, {})
         self.assertEqual(ranked[0]['id'], 'person')
         self.assertLess(ranked[1]['relevance_score'], 0.8)
+        self.assertFalse(ranked[1]['compatible'])
 
     def test_youtube_no_subtitle_match_never_uses_start_zero(self):
         with tempfile.TemporaryDirectory() as tmp:

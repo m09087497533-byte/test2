@@ -90,6 +90,7 @@ class Project:
         if not math.isfinite(start) or start < 0:
             raise ValueError('Начало фрагмента должно быть >= 0')
         candidate = candidate or {}
+        self.segments[index].pop('photo_fingerprint', None)
         self.segments[index].update(
             footage_path=str(path), media_kind=media_kind(path), source_start=start,
             footage_source=candidate.get('provider', 'local'),
@@ -98,6 +99,7 @@ class Project:
             license_url=candidate.get('license_url', ''),
             title=candidate.get('title', path.name),
             selected_candidate_id=candidate.get('id'),
+            asset_url=candidate.get('photo_url') or candidate.get('video_url') or '',
         )
         self.save()
 

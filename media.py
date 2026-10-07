@@ -12,7 +12,7 @@ import requests
 from ddgs import DDGS
 import photo
 import footage
-from search_policy import SearchPolicy, rank_candidates
+from search_policy import SearchPolicy, rank_candidates, rank_search_metadata
 
 
 def safe_url(url):
@@ -73,7 +73,7 @@ def semantic_query(seg, context=''):
     return photo.generate_scene_query(text)
 
 
-def search(seg, kind=None, context='', limit=6, policy=None):
+def search(seg, kind=None, context='', limit=6, policy=None, fresh=False):
     kind = kind or seg.get('desired_kind', 'photo')
     query = semantic_query(seg, context)
     if kind == 'auto':
@@ -84,9 +84,10 @@ def search(seg, kind=None, context='', limit=6, policy=None):
     if not photo.FASTGEN_API_KEY and not seg.get('search_query'):
         warnings.append('FASTGEN_API_KEY не задан: используется перевод текста вместо LLM-планирования.')
     results = []
+    cache_query = f'{query}|limit={limit}'
     if kind == 'photo':
         if policy:
-            results, skipped = policy.call('webphoto', query, lambda: photo._search_web_images(query, limit))
+            results, skipped = policy.call('webphoto', cache_query, lambda: photo._search_web_images(query, limit), refresh=fresh)
         else:
             results, skipped = photo._search_web_images(query, limit)
         if skipped:
@@ -102,7 +103,7 @@ def search(seg, kind=None, context='', limit=6, policy=None):
             if not key:
                 continue
             try:
-                found = policy.call(name, query, lambda f=function: f(query, limit)) if policy else function(query, limit)
+                found = policy.call(name, cache_query, lambda f=function: f(query, limit), refresh=fresh) if policy else function(query, limit)
                 results.extend(found)
             except Exception as exc:
                 warnings.append(str(exc) if isinstance(exc, RuntimeError) else
@@ -111,7 +112,7 @@ def search(seg, kind=None, context='', limit=6, policy=None):
             item['media_kind'] = 'video'
     elif kind == 'youtube':
         function = lambda: json.loads(run_ytdlp(['--flat-playlist', '--dump-single-json', f'ytsearch{limit}:{query}']))
-        data = policy.call('youtube', query, function) if policy else function()
+        data = policy.call('youtube', cache_query, function, refresh=fresh) if policy else function()
         for entry in data.get('entries') or []:
             url = entry.get('webpage_url') or entry.get('url') or ''
             if not url.startswith('http'):
@@ -139,11 +140,21 @@ def search(seg, kind=None, context='', limit=6, policy=None):
     for item in results:
         item['query'] = query
     if not results:
-        warnings.append('Варианты не найдены. Измените запрос или назначьте свой файл.')
-    if seg.get('strict_relevance'):
-        results = rank_candidates(seg, results, {'context': context})
-        if not any(c.get('relevance_score', 0) >= 0.8 for c in results):
-            warnings.append('Нет вариантов с подтверждённым совпадением по метаданным. Сцена оставлена для проверки.')
+        warnings.append('По этому запросу результатов нет; автоподбор попробует другой запрос.')
+    if seg.get('strict_relevance') and results:
+        if policy and not policy.metadata_ranker_available:
+            results = rank_search_metadata(seg, results)
+        else:
+            try:
+                results = rank_candidates(seg, results, {'context': context})
+            except Exception as exc:
+                if policy:
+                    policy.metadata_ranker_available = False
+                results = rank_search_metadata(seg, results)
+                warnings.append('Оценка текстовой модели недоступна (' + type(exc).__name__ +
+                                '); выбираю по поисковой выдаче и названиям, без ручного выбора.')
+    elif results:
+        results = rank_search_metadata(seg, results)
     return results, warnings
 
 
@@ -237,96 +248,180 @@ def download(candidate, directory, duration, source_start=0.0, allow_external=Fa
     return dest
 
 
-def auto_pick(project, log=print, cancelled=lambda: False):
+def _candidate_key(candidate):
+    return candidate.get('photo_url') or candidate.get('video_url') or candidate['id']
+
+
+def _candidate_score(candidate):
+    try:
+        value = float(candidate.get('relevance_score') or 0)
+        return value if math.isfinite(value) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _search_attempts(seg, context, allow_external):
+    """Keep named subjects while changing query language or falling back to photos."""
+    primary = semantic_query(seg, context).strip()
+    queries = list(dict.fromkeys(q for q in (primary, str(seg.get('query_en') or '').strip(),
+                         str(seg.get('subject') or '').strip()) if q))
+    kind = seg.get('desired_kind', 'photo')
+    kinds = [kind] if kind == 'photo' else [kind, 'photo']
+    if kind in ('youtube', 'web') and not allow_external:
+        kinds = ['photo']
+    for source in kinds:
+        source_queries = queries
+        if source == 'stock' and seg.get('query_en'):
+            source_queries = list(dict.fromkeys([seg['query_en'], *queries]))
+        # A failed video search shouldn't delay the photo fallback with dozens of subtitle requests.
+        for query in source_queries[:3 if source == 'photo' else 2]:
+            yield source, query
+
+
+def _try_candidates(project, index, candidates, attempted, log, cancelled):
+    seg = project.segments[index]
+    # The best relative match is tried first, including scores below the former 80% gate.
+    candidates = sorted(candidates, key=_candidate_score, reverse=True)
+    for candidate in candidates:
+        if cancelled():
+            return False
+        key = _candidate_key(candidate)
+        if key in attempted:
+            continue
+        attempted.add(key)
+        if candidate.get('compatible') is False:
+            continue
+        candidate.setdefault('media_kind', 'photo' if candidate.get('photo_url') else 'video')
+        external = candidate['provider'] in ('youtube', 'webvideo')
+        if external and not project.settings['allow_external']:
+            continue
+        if not external and any(j != index and s.get('footage_path') and Path(s['footage_path']).is_file() and
+                (s.get('selected_candidate_id') == candidate['id'] or
+                 (s.get('asset_url') and s['asset_url'] == key)) for j, s in enumerate(project.segments)):
+            continue
+        try:
+            start = 0.0
+            if external:
+                match = suggest_start(candidate, seg)
+                if not match:
+                    log(f'Сцена {index + 1}: интервал видео не найден, пробую другой материал.')
+                    continue
+                start = match['start']
+                candidate['caption_match'] = match
+            clip_duration = min(8.0, seg['end'] - seg['start'])
+            if external and any(s.get('source_url') == candidate.get('source_url') and
+                    s is not seg and s.get('footage_path') and Path(s['footage_path']).is_file() and
+                    start < s.get('original_source_start', 0) + s.get('source_clip_duration', 8) and
+                    start + clip_duration > s.get('original_source_start', 0) for s in project.segments):
+                continue
+            path = download(candidate, project.media_dir, seg['end'] - seg['start'],
+                            start, project.settings['allow_external'])
+            if cancelled():
+                return False
+            fingerprint = None
+            if candidate.get('media_kind') == 'photo':
+                fingerprint = photo_fingerprint(path)
+                repeated = False
+                for other in project.segments:
+                    if other is seg:
+                        continue
+                    if (other.get('media_kind') != 'photo' or not other.get('footage_path')
+                            or not Path(other['footage_path']).is_file()):
+                        continue
+                    previous = other.get('photo_fingerprint')
+                    if previous is None and Path(other['footage_path']).is_file():
+                        try:
+                            previous = photo_fingerprint(other['footage_path'])
+                        except (OSError, ValueError):
+                            continue
+                        other['photo_fingerprint'] = previous
+                    if previous and (int(fingerprint, 16) ^ int(previous, 16)).bit_count() <= 2:
+                        repeated = True
+                        break
+                if repeated:
+                    log('Повтор изображения пропущен; выбираю следующее фото.')
+                    continue
+            project.assign(index, path, candidate, 0.0)
+            actual_kind = ('photo' if candidate.get('media_kind') == 'photo' else
+                           'youtube' if candidate['provider'] == 'youtube' else 'web' if external else 'stock')
+            if actual_kind != seg.get('desired_kind'):
+                seg.setdefault('planned_kind', seg.get('desired_kind'))
+                seg['desired_kind'] = actual_kind
+                log(f'Сцена {index + 1}: вместо недоступного видео автоматически добавлено фото.')
+            seg.update(original_source_start=start, source_clip_duration=clip_duration,
+                       review_status='automatically_selected', auto_pick_status='assigned')
+            seg.pop('auto_pick_error', None)
+            if fingerprint:
+                seg['photo_fingerprint'] = fingerprint
+            project.save()
+            score = _candidate_score(candidate)
+            note = f', оценка {score:.0%}' if candidate.get('relevance_score') is not None else ''
+            log(f'Сцена {index + 1}/{len(project.segments)}: {candidate["provider"]}{note}, автоматически добавлено.')
+            return True
+        except Exception as exc:
+            log(f'Вариант недоступен ({type(exc).__name__}); пробую следующий.')
+    return False
+
+
+def auto_pick(project, log=print, cancelled=lambda: False, scene_indices=None, replace_existing=False, progress=None):
     assigned = 0
     policy = SearchPolicy(project.project_dir)
-    if any(s.get('desired_kind') == 'auto' for s in project.segments):
+    indices = list(range(len(project.segments))) if scene_indices is None else list(scene_indices)
+    if any(project.segments[i].get('desired_kind') == 'auto' for i in indices):
         raise RuntimeError('Сначала создайте смысловой план рассказа. Случайное чередование отключено.')
-    for i, seg in enumerate(project.segments):
+    for i in indices:
+        seg = project.segments[i]
         if cancelled():
-            log('Остановлено. Готовые сцены сохранены.')
             break
-        if seg.get('footage_path') and Path(seg['footage_path']).is_file():
-            continue
-        kind = seg.get('desired_kind', 'photo')
-        if kind in ('youtube', 'web') and not project.settings['allow_external']:
-            log(f'Сцена {i + 1}: загрузка внешних видео не включена.')
+        if seg.get('footage_path') and Path(seg['footage_path']).is_file() and not replace_existing:
             continue
         context = ' '.join(s['text'] for s in project.segments[max(0, i - 1):i + 2])
-        try:
-            candidates, warnings = search(seg, context=context, policy=policy)
-            seg['candidates'] = candidates
-            project.save()
-            for warning in warnings:
-                log(warning)
-            used = {s.get('selected_candidate_id') for s in project.segments if s.get('footage_path')}
-            used_urls = {s.get('source_url') for s in project.segments if s.get('footage_path')}
-            candidates = [c for c in candidates if c['provider'] in ('youtube', 'webvideo') or
-                          (c['id'] not in used and (not c.get('source_url') or c['source_url'] not in used_urls))]
-            if seg.get('strict_relevance'):
-                candidates = [c for c in candidates if c.get('relevance_score', 0) >= 0.8]
-            for candidate in candidates[:5]:
-                if cancelled():
-                    break
-                try:
-                    start = 0.0
-                    if kind in ('youtube', 'web'):
-                        try:
-                            match = suggest_start(candidate, seg)
-                            if match:
-                                start = match['start']
-                                candidate['caption_match'] = match
-                                log(f"Сцена {i + 1}: совпадение в субтитрах на {start:.1f}с")
-                            else:
-                                log(f'Сцена {i + 1}: нет подходящего таймкода; начало ролика автоматически не назначается.')
-                                continue
-                        except Exception:
-                            log(f'Сцена {i + 1}: таймкод не подтверждён; попробуйте следующий вариант или укажите начало вручную.')
-                            continue
-                    clip_duration = min(8.0, seg['end'] - seg['start'])
-                    if kind in ('youtube', 'web') and any(
-                        s.get('source_url') == candidate.get('source_url') and s.get('footage_path') and
-                        start < s.get('original_source_start', 0) + s.get('source_clip_duration', 8) and
-                        start + clip_duration > s.get('original_source_start', 0)
-                        for s in project.segments):
-                        log('Этот интервал видео уже использован; повтор пропущен.')
+        attempted, merged = set(), list(seg.get('candidates', []))
+        refresh_search = bool(merged)
+        seg['auto_pick_status'] = 'searching'
+        # Reuse previously found results, including those previously rejected only for a low score.
+        success = _try_candidates(project, i, merged, attempted, log, cancelled)
+        if not success and not cancelled():
+            try:
+                attempts = _search_attempts(seg, context, project.settings['allow_external'])
+                for kind, query in attempts:
+                    if cancelled():
+                        break
+                    log(f'Сцена {i + 1}: расширяю поиск ({kind}) — {query}')
+                    request = {**seg, 'desired_kind': kind, 'search_query': query, 'manual_query': True}
+                    try:
+                        candidates, warnings = search(request, kind=kind, context=context, limit=18 if kind == 'photo' else 6,
+                                                       policy=policy, fresh=refresh_search)
+                    except Exception as exc:
+                        log(f'Поиск недоступен ({type(exc).__name__}); пробую следующий запрос/источник.')
                         continue
-                    path = download(candidate, project.media_dir, seg['end'] - seg['start'],
-                                    start, project.settings['allow_external'])
-                    fingerprint = None
-                    if candidate.get('media_kind') == 'photo':
-                        fingerprint = photo_fingerprint(path)
-                        repeated = False
-                        for other in project.segments:
-                            if other.get('media_kind') != 'photo' or not other.get('footage_path'):
-                                continue
-                            previous = other.get('photo_fingerprint')
-                            if previous is None and Path(other['footage_path']).is_file():
-                                previous = photo_fingerprint(other['footage_path'])
-                                other['photo_fingerprint'] = previous
-                            if previous and (int(fingerprint, 16) ^ int(previous, 16)).bit_count() <= 2:
-                                repeated = True
-                                break
-                        if repeated:
-                            log('Фото совпадает с уже использованным изображением; повтор пропущен.')
-                            continue
-                    project.assign(i, path, candidate, 0.0)
-                    seg['original_source_start'] = start
-                    seg['source_clip_duration'] = clip_duration
-                    seg['review_status'] = 'metadata_matched_needs_visual_review'
-                    if fingerprint:
-                        seg['photo_fingerprint'] = fingerprint
+                    for warning in warnings:
+                        log(warning)
+                    known = {_candidate_key(c) for c in merged}
+                    merged.extend(c for c in candidates if _candidate_key(c) not in known)
+                    seg['candidates'] = merged
                     project.save()
-                    assigned += 1
-                    log(f'Сцена {i + 1}/{len(project.segments)}: {candidate["provider"]}, сохранено.')
-                    break
-                except Exception as exc:
-                    log(f'Вариант не загрузился ({type(exc).__name__}); пробую следующий.')
-            else:
-                log(f'Сцена {i + 1}: подходящий файл не загружен.')
-        except Exception as exc:
-            log(f'Сцена {i + 1}: {exc}')
+                    success = _try_candidates(project, i, candidates, attempted, log, cancelled)
+                    if success:
+                        break
+            except Exception as exc:
+                log(f'Сцена {i + 1}: поиск недоступен ({type(exc).__name__}).')
+        if success:
+            assigned += 1
+        elif seg.get('footage_path') and Path(seg['footage_path']).is_file():
+            seg['auto_pick_status'] = 'assigned'
+            project.save()
+        elif not cancelled():
+            seg.update(auto_pick_status='temporarily_unavailable',
+                       auto_pick_error='Источники не вернули доступный файл после расширенного поиска.')
+            log(f'Сцена {i + 1}: источники сейчас недоступны. Повторный автоподбор продолжит эту сцену.')
+            project.save()
+        if progress:
+            ready = sum(bool(s.get('footage_path') and Path(s['footage_path']).is_file()) for s in project.segments)
+            progress(ready, len(project.segments))
+    if cancelled():
+        log('Остановлено. Готовые сцены сохранены.')
     ready = sum(bool(s.get('footage_path') and Path(s['footage_path']).is_file()) for s in project.segments)
-    log(f'Результат подбора: {ready}/{len(project.segments)} сцен с файлами; '
-        f'{len(project.segments) - ready} требуют выбора или проверки. Новых назначений: {assigned}.')
+    log(f'Результат автоподбора: {ready}/{len(project.segments)} сцен заполнено; новых назначений: {assigned}. '
+        f'Временно недоступных: {len(project.segments) - ready}.')
     return assigned

@@ -89,6 +89,41 @@ class GuiTests(unittest.TestCase):
             self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
                                  self.root.winfo_rooty() + self.root.winfo_height())
 
+    def test_search_button_assigns_photo_without_selecting_a_card(self):
+        from PIL import Image
+        image = Path(self.tmp.name) / 'downloaded.png'
+        Image.new('RGB', (160, 90), 'green').save(image)
+        self.app.kind.set('Фото')
+        self.app.query.set('steam train')
+        candidate = {'id': 'auto', 'provider': 'web', 'media_kind': 'photo', 'relevance_score': 0.55}
+        with patch('main.media.search', return_value=([candidate], [])), \
+             patch('main.media.download', return_value=image), patch.object(self.app.message, 'showerror') as error:
+            self.app.search()
+            self.wait_task()
+        error.assert_not_called()
+        scene = self.app.project.segments[0]
+        self.assertEqual(scene['selected_candidate_id'], 'auto')
+        self.assertTrue(Path(scene['footage_path']).is_file())
+        self.assertEqual(scene['auto_pick_status'], 'assigned')
+
+    def test_render_button_fills_missing_scenes_before_rendering(self):
+        from PIL import Image
+        image = Path(self.tmp.name) / 'ready.png'
+        Image.new('RGB', (160, 90), 'green').save(image)
+        calls = []
+        def autopick(project, *args):
+            calls.append('pick')
+            project.assign(0, image)
+        def render(*args, **kwargs):
+            calls.append('render')
+            self.assertTrue(Path(args[0][0]['footage_path']).is_file())
+        with patch('main.plan_and_pick', side_effect=autopick), \
+             patch('main.render.build_video', side_effect=render), patch.object(self.app.message, 'showinfo') as done:
+            self.app.render()
+            self.wait_task()
+        self.assertEqual(calls, ['pick', 'render'])
+        done.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

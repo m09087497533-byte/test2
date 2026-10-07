@@ -199,7 +199,8 @@ def build_video(segments, audio_path, output_path, settings=None, log_fn=print, 
     items = timeline(segments, audio_duration, fps)
     missing = [i + 1 for i, s in enumerate(items) if not s.get('footage_path') or not Path(s['footage_path']).is_file()]
     if missing:
-        raise ValueError('Назначьте файлы для сцен: ' + ', '.join(map(str, missing)))
+        raise ValueError('Источники пока не дали доступные файлы для сцен: ' + ', '.join(map(str, missing)) +
+                         '. Проверьте подключение и запустите повторный автоподбор.')
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='mixed_render_', dir=output_path.parent) as tmp:
         tmp = Path(tmp)
