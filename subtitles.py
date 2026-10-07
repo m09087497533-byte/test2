@@ -15,7 +15,7 @@ def seconds(value):
     return int(h or 0) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
 
-def import_subtitle_file(path, max_duration=6.0):
+def import_subtitle_file(path, max_duration=None):
     segments = []
     raw = Path(path).read_text(encoding='utf-8-sig').replace('\r\n', '\n')
     for block in re.split(r'\n\s*\n', raw):
@@ -31,12 +31,15 @@ def import_subtitle_file(path, max_duration=6.0):
             if end <= start:
                 raise ValueError('Конец реплики должен быть позже начала')
             words = text.split()
-            count = min(len(words), max(1, __import__('math').ceil((end - start) / max_duration)))
+            count = min(len(words), max(1, __import__('math').ceil((end - start) / max_duration))) if max_duration else 1
             for j in range(count):
                 lo, hi = j * len(words) // count, (j + 1) * len(words) // count
                 segments.append({'text': ' '.join(words[lo:hi]),
                                  'start': start + (end - start) * lo / len(words),
-                                 'end': start + (end - start) * hi / len(words)})
+                                 'end': start + (end - start) * hi / len(words),
+                                 'timing_quality': 'estimated',
+                                 'words': [{'text': words[k], 'start': start + (end - start) * k / len(words),
+                                            'end': start + (end - start) * (k + 1) / len(words)} for k in range(lo, hi)]})
             break
     validate_segments(segments)
     return {'text': ' '.join(s['text'] for s in segments), 'segments': segments}

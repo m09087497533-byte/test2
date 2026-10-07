@@ -105,7 +105,7 @@ def split_into_scenes(segments: list[dict], max_duration: float = 8.0, min_durat
     return scenes
 
 
-def transcribe_audio(audio_path: Path, language_codes=None, progress_cb=None) -> dict:
+def transcribe_audio(audio_path: Path, language_codes=None, progress_cb=None, split_scenes=True) -> dict:
     """
     Возвращает:
     {
@@ -172,7 +172,9 @@ def transcribe_audio(audio_path: Path, language_codes=None, progress_cb=None) ->
                 for seg in segments_raw
                 if seg.get("text", "").strip()
             ]
-            scenes = split_into_scenes(segments)
+            for seg in segments:
+                seg['timing_quality'] = 'word' if seg['words'] else 'estimated'
+            scenes = split_into_scenes(segments) if split_scenes else segments
             report(f"Разбито на {len(scenes)} сцен (было {len(segments)} сегмент(ов) от API)")
             return {"text": result.get("text") or "", "segments": scenes}
         elif s == "failed":

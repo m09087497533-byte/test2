@@ -6,6 +6,7 @@ from pathlib import Path
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff'}
 PATTERNS = {
+    'По смыслу рассказа': ['auto'],
     'Фото / стоки': ['photo', 'stock'],
     'Фото / стоки / YouTube': ['photo', 'stock', 'photo', 'youtube'],
     'Фото / стоки / интернет': ['photo', 'stock', 'photo', 'web'],
@@ -39,9 +40,14 @@ class Project:
         self.thumbs_dir = self.project_dir / 'thumbs'
         self.project_file = self.project_dir / 'project.json'
         self.segments = []
+        self.story = {}
+        self.name_titles = []
+        self.raw_transcript = []
         self.settings = {
-            'pattern': 'Фото / стоки', 'width': 1280, 'height': 720, 'fps': 25,
-            'transition': 0.25, 'subtitles': True, 'allow_external': False,
+            'pattern': 'По смыслу рассказа', 'width': 1280, 'height': 720, 'fps': 25,
+            'transition': 0, 'subtitles': False, 'allow_external': False,
+            'photo_layout': 'portrait_triptych', 'photo_effect': 'slide_up',
+            'name_titles_enabled': True, 'min_scene': 6.0, 'photo_max': 14.0, 'video_max': 8.0,
         }
 
     def ensure_dirs(self):
@@ -59,7 +65,8 @@ class Project:
             bucket = old.get(seg['text'], [])
             carried = bucket.pop(0) if bucket else {}
             item = dict(carried)
-            item.update(index=i, text=seg['text'], start=float(seg['start']), end=float(seg['end']))
+            item.update(index=i, text=seg['text'], start=float(seg['start']), end=float(seg['end']),
+                        words=seg.get('words', []), timing_quality=seg.get('timing_quality', 'estimated'))
             item.setdefault('desired_kind', pattern[i % len(pattern)])
             item.setdefault('source_start', 0.0)
             item.setdefault('candidates', [])
@@ -96,8 +103,9 @@ class Project:
 
     def save(self):
         self.ensure_dirs()
-        data = {'version': 2, 'audio_path': str(self.audio_path),
+        data = {'version': 3, 'audio_path': str(self.audio_path),
                 'segments': self.segments, 'settings': self.settings}
+        data.update(story=self.story, name_titles=self.name_titles, raw_transcript=self.raw_transcript)
         tmp = self.project_file.with_suffix('.json.tmp')
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
         os.replace(tmp, self.project_file)
@@ -108,6 +116,9 @@ class Project:
         data = json.loads(self.project_file.read_text(encoding='utf-8'))
         self.settings.update(data.get('settings', {}))
         self.segments = data.get('segments', [])
+        self.story = data.get('story', {})
+        self.name_titles = data.get('name_titles', [])
+        self.raw_transcript = data.get('raw_transcript', [])
         pattern = PATTERNS.get(self.settings['pattern'], ['photo', 'stock'])
         for i, seg in enumerate(self.segments):
             seg['index'] = i

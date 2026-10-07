@@ -8,6 +8,43 @@ import tempfile
 from pathlib import Path
 from project import media_kind, validate_segments
 from subtitles import write_srt
+from titles import write_name_ass
+
+
+def photo_card_graph(width, height, fps, effect='slide_up', triptych=False):
+    """9:16 на белом поле; три копии — композиция внутри одной сцены, не смена сюжетов."""
+    count = 3 if triptych and width > height else 1
+    gap = max(4, round(width * 0.009))
+    card_h = int(min(height * 0.90, (width - gap * (count + 1)) / count * 16 / 9)) // 2 * 2
+    card_w = int(card_h * 9 / 16) // 2 * 2
+    offset = (width - count * card_w - (count - 1) * gap) / 2
+    top = (height - card_h) / 2
+    graph = [f'[1:v]fps={fps},split={count}' + ''.join(f'[p{i}]' for i in range(count))]
+    previous = '0:v'
+    for i in range(count):
+        start = i * 0.4 if count == 3 else 0
+        x = offset + i * (card_w + gap)
+        y = str(top)
+        if effect == 'slide_up':
+            y = f'{top}+{height * 0.07}*max(0,1-(t-{start})/0.35)'
+        elif effect == 'slide_left':
+            x = f'{x}+{width * 0.08}*max(0,1-(t-{start})/0.35)'
+        base = (f'scale={card_w}:{card_h}:force_original_aspect_ratio=increase,'
+                f'crop={card_w}:{card_h}:x=(iw-ow)/2:y=(ih-oh)*0.30,setsar=1,format=rgba')
+        if effect in ('pop', 'slow_zoom'):
+            zoom = (f'0.92+0.08*min(1,max(0,(t-{start})/0.35))' if effect == 'pop'
+                    else '1+0.008*t')
+            base += f",scale=w='trunc({card_w}*({zoom})/2)*2':h='trunc({card_h}*({zoom})/2)*2':eval=frame"
+            x = f'{offset + i * (card_w + gap)}+({card_w}-overlay_w)/2'
+            y = f'{top}+({card_h}-overlay_h)/2'
+        if effect != 'none':
+            base += f',fade=t=in:st={start}:d=0.20:alpha=1'
+        graph.append(f'[p{i}]{base}[c{i}]')
+        graph.append(f"[{previous}][c{i}]overlay=x='{x}':y='{y}':enable='gte(t,{start})':"
+                     f'eof_action=repeat:shortest=1[o{i}]')
+        previous = f'o{i}'
+    graph.append(f'[{previous}]format=yuv420p,setsar=1,setpts=PTS-STARTPTS[out]')
+    return ';'.join(graph)
 
 
 def run(command, cwd=None, timeout=600):
@@ -46,16 +83,28 @@ def timeline(segments, audio_duration, fps):
     return result
 
 
-def make_clip(item, out, width, height, fps, transition, index):
+def make_clip(item, out, width, height, fps, transition, index, settings=None):
+    settings = settings or {}
     frames = item['frames']
     length = frames / fps
     path = Path(item['footage_path']).resolve()
     kind = item.get('media_kind') or media_kind(path)
     base = f'scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1'
     if kind == 'photo':
+        layout = item.get('photo_layout') or settings.get('photo_layout', 'portrait_triptych')
+        effect = item.get('effect') or settings.get('photo_effect', 'slide_up')
+        if layout in ('portrait_card', 'portrait_triptych'):
+            graph = photo_card_graph(width, height, fps, effect, layout == 'portrait_triptych')
+            run(['ffmpeg', '-y', '-v', 'error', '-filter_complex_threads', '1',
+                 '-f', 'lavfi', '-i', f'color=white:s={width}x{height}:r={fps}:d={length}',
+                 '-loop', '1', '-framerate', str(fps), '-i', str(path),
+                 '-filter_complex', graph, '-map', '[out]', '-frames:v', str(frames), '-an',
+                 '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '20',
+                 '-pix_fmt', 'yuv420p', '-r', str(fps), str(out)], timeout=max(120, length * 20))
+            return
         # Один входной кадр -> строго нужное число кадров zoompan.
         progress = f'on/{max(1, frames - 1)}'
-        zoom = f'1+0.10*{progress}' if index % 2 == 0 else f'1.10-0.10*{progress}'
+        zoom = f'1+0.06*{progress}' if effect != 'none' else '1'
         vf = (f'scale={width * 2}:{height * 2}:force_original_aspect_ratio=increase,'
               f'crop={width * 2}:{height * 2},'
               f"zoompan=z='{zoom}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':"
@@ -63,21 +112,36 @@ def make_clip(item, out, width, height, fps, transition, index):
         inputs = ['-i', str(path)]
     else:
         start = float(item.get('source_start', 0))
-        if not math.isfinite(start) or start < 0 or start >= duration(path):
+        source_duration = duration(path)
+        if not math.isfinite(start) or start < 0 or start >= source_duration:
             raise ValueError(f'Начало фрагмента вне видео: сцена {index + 1}')
-        inputs = ['-stream_loop', '-1', '-ss', str(start), '-i', str(path)]
-        vf = base + f',fps={fps}'
+        limit = min(8.0, float(settings.get('video_max', 8.0)), source_duration - start)
+        if start > 0 or source_duration > limit + 0.03:
+            # Отдельный конечный файл: внутренний trim после -ss в FFmpeg может обрезать кадры tpad.
+            cut = out.with_name(out.stem + '_source.mp4')
+            seek = ['-ss', str(start)] if start > 0 else []
+            run(['ffmpeg', '-y', '-v', 'error', *seek, '-i', str(path), '-t', str(limit),
+                 '-an', '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast',
+                 '-pix_fmt', 'yuv420p', str(cut)], timeout=max(120, limit * 20))
+            path = cut
+        inputs = ['-i', str(path)]
+        # Не зацикливаем спортивное действие. После <=8с движения держим последний кадр на паузе.
+        vf = (f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
+              f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,'
+              f'tpad=stop_mode=clone:stop_duration={length},fps={fps}')
     fade = min(transition, length / 3)
     if fade > 0:
         vf += f',fade=t=in:st=0:d={fade},fade=t=out:st={length - fade}:d={fade}'
-    vf += ',format=yuv420p,setpts=PTS-STARTPTS'
+    vf += ',format=yuv420p'
+    if kind == 'photo':
+        vf += ',setpts=PTS-STARTPTS'
     run(['ffmpeg', '-y', '-v', 'error', '-filter_threads', '1', *inputs,
          '-map', '0:v:0', '-vf', vf, '-frames:v', str(frames), '-an',
          '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '20',
          '-pix_fmt', 'yuv420p', '-r', str(fps), str(out)], timeout=max(120, length * 20))
 
 
-def build_video(segments, audio_path, output_path, settings=None, log_fn=print):
+def build_video(segments, audio_path, output_path, settings=None, log_fn=print, name_titles=None):
     if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
         raise RuntimeError('Установите FFmpeg и добавьте ffmpeg/ffprobe в PATH')
     settings = settings or {}
@@ -106,7 +170,10 @@ def build_video(segments, audio_path, output_path, settings=None, log_fn=print):
         for i, item in enumerate(items):
             out = tmp / f'clip_{i:05}.mp4'
             log_fn(f'Монтаж сцены {i + 1}/{len(items)}: {item.get("media_kind") or media_kind(item["footage_path"])}')
-            make_clip(item, out, width, height, fps, transition, i)
+            make_clip(item, out, width, height, fps, transition, i, settings)
+            stream = next(s for s in probe(out)['streams'] if s['codec_type'] == 'video')
+            if int(stream.get('nb_frames', -1)) != item['frames']:
+                raise RuntimeError(f'Длительность сцены {i + 1} не совпадает с планом; сборка остановлена.')
             clips.append(out)
         (tmp / 'concat.txt').write_text(''.join(f"file '{p.name}'\n" for p in clips), encoding='utf-8')
         video_only = tmp / 'video.mp4'
@@ -115,9 +182,15 @@ def build_video(segments, audio_path, output_path, settings=None, log_fn=print):
         result = tmp / 'final.mp4'
         command = ['ffmpeg', '-y', '-v', 'error', '-filter_threads', '1',
                    '-i', str(video_only), '-i', str(audio_path), '-map', '0:v:0', '-map', '1:a:0']
-        if settings.get('subtitles', True):
+        filters = []
+        if settings.get('subtitles', False):
             write_srt(segments, tmp / 'subtitles.srt')
-            command += ['-vf', 'subtitles=subtitles.srt:force_style=\'FontSize=22,Outline=2,MarginV=28\'',
+            filters.append('subtitles=subtitles.srt:force_style=\'FontSize=22,Outline=2,MarginV=28\'')
+        if name_titles and settings.get('name_titles_enabled', True):
+            write_name_ass(name_titles, tmp / 'names.ass', width, height, audio_duration)
+            filters.append('ass=names.ass')
+        if filters:
+            command += ['-vf', ','.join(filters),
                         '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '20']
         else:
             command += ['-c:v', 'copy']
@@ -138,5 +211,6 @@ def build_video(segments, audio_path, output_path, settings=None, log_fn=print):
                 'original_source_start': s.get('original_source_start', s.get('source_start', 0))}
                for i, s in enumerate(segments)]
     output_path.with_suffix('.sources.json').write_text(json.dumps(sources, ensure_ascii=False, indent=2), encoding='utf-8')
+    output_path.with_suffix('.names.json').write_text(json.dumps(name_titles or [], ensure_ascii=False, indent=2), encoding='utf-8')
     log_fn(f'Готово: {output_path}')
     return output_path

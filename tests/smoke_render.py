@@ -32,7 +32,7 @@ def main(output):
     ])
     for i, name in enumerate(('first.jpg', 'test_stock.mp4', 'last.jpg')):
         project.assign(i, output / name)
-    project.settings.update(width=640, height=360, subtitles=True, transition=0.1)
+    project.settings.update(width=640, height=360, subtitles=True, transition=0.1, photo_layout='full_bleed')
     project.save()
     final = build_video(project.segments, audio, project.project_dir / 'final_video.mp4', project.settings)
     info = probe(final)
@@ -45,10 +45,10 @@ def main(output):
         data = subprocess.check_output(['ffmpeg', '-v', 'error', '-ss', str(time), '-i', str(final),
                    '-frames:v', '1', '-vf', 'crop=40:40:20:20,scale=1:1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'])
         assert len(data) == 3 and data[color] > max(data[c] for c in range(3) if c != color) + 30, (time, list(data))
-    # Видеоклип короче сцены: второй синий кадр подтверждает зацикливание.
+    # Видеоклип короче сцены: второй синий кадр подтверждает удержание последнего кадра.
     assert final.with_suffix('.srt').is_file()
     assert len(json.loads(final.with_suffix('.sources.json').read_text())) == 3
-    print('PASS: фото → видео → фото, паузы, зацикливание, 5с аудио, субтитры, список источников.')
+    print('PASS: смешанный монтаж, паузы, удержание кадра, 5с аудио, субтитры, список источников.')
     # Проверяем повторный запуск и вертикальный формат без прожига субтитров.
     project.settings.update(width=360, height=640, subtitles=False, transition=0)
     vertical = build_video(project.segments, audio, project.project_dir / 'vertical.mp4', project.settings)

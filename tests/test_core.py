@@ -17,7 +17,7 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = Project(Path(tmp) / 'voice.wav')
             p.set_segments_from_transcript([{'text': str(i), 'start': i * 2, 'end': i * 2 + 1} for i in range(4)])
-            self.assertEqual([s['desired_kind'] for s in p.segments], ['photo', 'stock', 'photo', 'stock'])
+            self.assertEqual([s['desired_kind'] for s in p.segments], ['auto'] * 4)
             file = Path(tmp) / 'photo.jpg'
             file.touch()
             p.assign(0, file)
@@ -90,12 +90,19 @@ class CoreTests(unittest.TestCase):
             p.set_segments_from_transcript([{'text': 'one', 'start': 0, 'end': 1},
                                             {'text': 'two', 'start': 1, 'end': 2}])
             file = Path(tmp) / 'local.jpg'
-            file.touch()
+            from PIL import Image, ImageDraw
+            image = Image.new('RGB', (80, 80), 'white')
+            ImageDraw.Draw(image).polygon([(0, 0), (79, 0), (0, 79)], fill='black')
+            image.save(file)
+            found = Path(tmp) / 'found.jpg'
+            image.transpose(Image.Transpose.FLIP_LEFT_RIGHT).save(found)
             p.assign(1, file)
+            p.segments[0]['desired_kind'] = 'photo'
+            p.segments[1]['desired_kind'] = 'photo'
             candidates = [{'id': 'bad', 'provider': 'web', 'media_kind': 'photo'},
                           {'id': 'good', 'provider': 'web', 'media_kind': 'photo'}]
             with patch.object(media, 'search', return_value=(candidates, [])), \
-                 patch.object(media, 'download', side_effect=[RuntimeError('bad file'), file]) as download:
+                 patch.object(media, 'download', side_effect=[RuntimeError('bad file'), found]) as download:
                 self.assertEqual(media.auto_pick(p, log=lambda _: None), 1)
                 self.assertEqual(download.call_count, 2)
             self.assertEqual(p.segments[0]['selected_candidate_id'], 'good')
