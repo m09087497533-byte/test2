@@ -15,6 +15,11 @@ from search_policy import SearchPolicy
 
 class AutomaticSelectionTests(unittest.TestCase):
     def setUp(self):
+        verifier = patch('media.visual_match.verify_file', return_value={
+            'compatible': True, 'relevance_score': 0.9, 'relevance_reason': 'Verified test fixture',
+            'visual_verified': True, 'relevance_basis': 'downloaded_visual_and_metadata'})
+        verifier.start()
+        self.addCleanup(verifier.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.project = Project(Path(self.tmp.name) / 'voice.wav')

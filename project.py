@@ -7,6 +7,35 @@ import os
 from pathlib import Path
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff'}
+SOURCE_MODES = {'auto', 'photo', 'stock', 'youtube', 'web'}
+
+
+def requested_source(settings, scene):
+    return scene.get('source_override') or (settings.get('source_mode') if settings.get('source_mode') != 'auto' else None)
+
+
+def effective_source(settings, scene):
+    return requested_source(settings, scene) or scene.get('desired_kind', 'auto')
+
+
+def source_matches(settings, scene, candidate=None):
+    required = requested_source(settings, scene)
+    if not required:
+        return True
+    item = candidate or scene
+    provider = item.get('provider', item.get('footage_source', 'local'))
+    kind = item.get('media_kind') or media_kind(item.get('footage_path', ''))
+    return ((required == 'photo' and kind == 'photo') or
+            (required == 'stock' and kind == 'video' and provider in ('pexels', 'pixabay', 'local')) or
+            (required == 'youtube' and provider == 'youtube') or
+            (required == 'web' and kind == 'video' and provider == 'webvideo'))
+
+
+def scene_ready(settings, scene):
+    path = scene.get('footage_path')
+    return bool(path and Path(path).is_file() and source_matches(settings, scene) and
+                (not settings.get('visual_verification', True) or scene.get('visual_verified') or
+                 scene.get('footage_source', 'local') == 'local' or scene.get('review_status') == 'manually_selected'))
 PATTERNS = {
     'По смыслу рассказа': ['auto'],
     'Фото / стоки': ['photo', 'stock'],
@@ -97,6 +126,7 @@ class Project:
             'transition': 0, 'subtitles': False, 'allow_external': False,
             'photo_layout': 'auto', 'photo_effect': 'slide_up',
             'name_titles_enabled': True, 'min_scene': 6.0, 'photo_max': 14.0, 'video_max': 8.0,
+            'source_mode': 'auto', 'visual_verification': True,
         }
 
     def ensure_dirs(self):
@@ -151,6 +181,8 @@ class Project:
             title=candidate.get('title', path.name),
             selected_candidate_id=candidate.get('id'),
             asset_url=candidate.get('photo_url') or candidate.get('video_url') or '',
+            visual_verified=candidate.get('visual_verified', False),
+            review_status='automatically_selected' if candidate.get('visual_verified') else 'manually_selected',
         )
         self.save()
 

@@ -11,6 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 @unittest.skipUnless(os.getenv('DISPLAY') or sys.platform in ('win32', 'darwin'), 'Нужен графический дисплей')
 class GuiTests(unittest.TestCase):
     def setUp(self):
+        verifier = patch('media.visual_match.verify_file', return_value={
+            'compatible': True, 'relevance_score': 0.9, 'relevance_reason': 'Verified test fixture',
+            'visual_verified': True, 'relevance_basis': 'downloaded_visual_and_metadata'})
+        verifier.start()
+        self.addCleanup(verifier.stop)
         import tkinter as tk
         from main import App
         from project import Project
@@ -74,6 +79,26 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(len(self.app.tree.get_children()), 2)
         self.assertTrue(all(s['footage_path'] == str(photo) for s in self.app.project.segments))
         self.assertTrue(list(project.project_dir.glob('project.before-timing.*.json')))
+
+    def test_global_source_choice_is_persisted_and_clears_previous_exceptions(self):
+        self.app.project.segments[0]['source_override'] = 'photo'
+        self.app.source_mode.set('Стоки')
+        self.app.change_source_mode()
+        self.root.update()
+        self.assertEqual(self.app.project.settings['source_mode'], 'stock')
+        self.assertNotIn('source_override', self.app.project.segments[0])
+        self.assertEqual(self.app.kind.get(), 'Стоки')
+        self.assertEqual(self.app.tree.item('0', 'values')[1], 'Стоки')
+
+    def test_scene_source_choice_persists_before_search_button_is_pressed(self):
+        from project import Project
+        self.app.kind.set('Стоки')
+        self.app.change_scene_source()
+        self.root.update()
+        loaded = Project(self.app.project.audio_path)
+        loaded.load()
+        self.assertEqual(loaded.segments[0]['source_override'], 'stock')
+        self.assertTrue(loaded.segments[0]['source_query_dirty'])
 
     def test_cards_keep_selection_and_discard_previous_scene_thumbnail(self):
         from PIL import Image

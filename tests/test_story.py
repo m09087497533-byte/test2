@@ -17,6 +17,13 @@ from titles import write_name_ass
 
 
 class StoryTests(unittest.TestCase):
+    def setUp(self):
+        verifier = patch('media.visual_match.verify_file', return_value={
+            'compatible': True, 'relevance_score': 0.9, 'relevance_reason': 'Verified test fixture',
+            'visual_verified': True, 'relevance_basis': 'downloaded_visual_and_metadata'})
+        verifier.start()
+        self.addCleanup(verifier.stop)
+
     def test_name_uses_word_time_not_scene_start_and_not_pronoun(self):
         words = [
             {'text': 'Здесь', 'start': 10, 'end': 10.3, 'timing_quality': 'word'},

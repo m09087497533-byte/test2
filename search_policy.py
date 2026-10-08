@@ -74,7 +74,8 @@ def rank_candidates(scene, candidates, story):
         'A query attached by the app is NOT evidence of candidate content. If metadata is insufficient, score low. '
         'Do not guess from filenames. Do not invent candidate IDs.\nSTORY:\n' +
         json.dumps(story, ensure_ascii=False) + '\nSCENE:\n' +
-        json.dumps({k: scene.get(k) for k in ('text', 'subject', 'search_query', 'visual_reason')}, ensure_ascii=False) +
+        json.dumps({k: scene.get(k) for k in ('text', 'subject', 'search_query', 'visual_reason', 'context',
+                                             'must_match', 'avoid', 'required_entities', 'depiction')}, ensure_ascii=False) +
         '\nCANDIDATES:\n' + json.dumps(input_data, ensure_ascii=False))
     known = {c['id']: c for c in candidates}
     ranked = []

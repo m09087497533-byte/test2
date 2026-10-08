@@ -18,7 +18,7 @@ import render
 import subtitles
 import transcribe
 import planner
-from project import Project, PATTERNS
+from project import Project, PATTERNS, effective_source, source_matches, scene_ready
 
 KINDS = {'По смыслу': 'auto', 'Фото': 'photo', 'Стоки': 'stock', 'YouTube': 'youtube', 'Интернет-видео': 'web'}
 LABELS = {v: k for k, v in KINDS.items()}
@@ -38,15 +38,27 @@ def timecode(seconds):
 
 def plan_and_pick(project, log=print, cancelled=lambda: False, progress=None):
     """One action for both a new transcript and an existing partially filled project."""
-    if not project.story or any(s.get('desired_kind') == 'auto' for s in project.segments):
+    if (not project.story or project.story.get('planner_version') != 4 or
+            project.story.get('source_mode', 'auto') != project.settings.get('source_mode', 'auto') or
+            any(effective_source(project.settings, s) == 'auto' for s in project.segments)):
         import copy
         previous = copy.deepcopy(project.segments)
         result = planner.plan_story(project.raw_transcript or project.segments,
                                     project.settings, log, cancelled)
         assignment_keys = ('footage_path', 'media_kind', 'source_start', 'footage_source', 'footage_query',
                            'source_url', 'license_url', 'title', 'selected_candidate_id', 'asset_url',
-                           'original_source_start', 'source_clip_duration', 'photo_fingerprint', 'review_status')
+                           'original_source_start', 'source_clip_duration', 'photo_fingerprint', 'review_status',
+                           'visual_verified', 'relevance_basis', 'relevance_reason')
         for scene in result['segments']:
+            overrides = [(min(scene['end'], s['end']) - max(scene['start'], s['start']), s)
+                         for s in previous if s.get('source_override') and
+                         s['start'] < scene['end'] and scene['start'] < s['end']]
+            if overrides:
+                chosen = max(overrides, key=lambda pair: pair[0])[1]['source_override']
+                scene['source_override'] = chosen
+                if scene['desired_kind'] != chosen:
+                    scene['desired_kind'] = chosen
+                    scene['source_query_dirty'] = True
             old = next((s for s in previous if s.get('footage_path') and Path(s['footage_path']).is_file()
                         and s['text'] == scene['text'] and abs(s['start'] - scene['start']) < 0.001
                         and abs(s['end'] - scene['end']) < 0.001), None)
@@ -59,7 +71,10 @@ def plan_and_pick(project, log=print, cancelled=lambda: False, progress=None):
 def doctor():
     checks = {'python': sys.version.split()[0], 'ffmpeg': bool(shutil.which('ffmpeg')),
               'ffprobe': bool(shutil.which('ffprobe')), 'tesseract_optional': bool(shutil.which('tesseract')),
-              'keys_present': {k: bool(os.getenv(k)) for k in ('FASTGEN_API_KEY', 'PEXELS_API_KEY', 'PIXABAY_API_KEY')}}
+              'keys_present': {k: bool(os.getenv(k)) for k in ('OPENAI_API_KEY', 'PEXELS_API_KEY', 'PIXABAY_API_KEY')}}
+    from importlib.util import find_spec
+    checks['local_whisper'] = find_spec('faster_whisper') is not None
+    checks['ai_provider'] = os.getenv('SCENEMIX_AI_PROVIDER', 'openai')
     runtime = Path(sys.executable).with_name('deno.exe' if sys.platform == 'win32' else 'deno')
     checks['youtube_js_runtime'] = bool(runtime.is_file() or shutil.which('deno') or shutil.which('node'))
     try:
@@ -92,7 +107,7 @@ class App:
         self.card_widgets = {}
         self.card_images = {}
         self.card_originals = {}
-        root.title('SceneMix 3.2 — автоматический подбор · монтаж по рассказу')
+        root.title('SceneMix 4 — фото или стоки · анализ содержимого')
         root.geometry(f'{min(1440, root.winfo_screenwidth() - 60)}x{min(960, root.winfo_screenheight() - 80)}')
         root.minsize(1080, 780)
         root.protocol('WM_DELETE_WINDOW', self.close)
@@ -100,10 +115,10 @@ class App:
         outer.pack(fill='both', expand=True)
         top = ttk.Frame(outer)
         top.pack(fill='x', pady=(0, 12))
-        self.toolbar_items = [ttk.Label(top, text='SceneMix 3.2', style='Title.TLabel')]
+        self.toolbar_items = [ttk.Label(top, text='SceneMix 4', style='Title.TLabel')]
         for label, command, color in [('Аудио', self.pick_audio, 'Blue'),
                 ('Распознать', self.transcribe_audio, None), ('SRT / VTT', self.import_subtitles, None),
-                ('API-ключи', self.key_settings, None), ('Смысловой план', self.make_plan, 'Peach'),
+                ('Настройки AI / ключи', self.key_settings, None), ('Смысловой план', self.make_plan, 'Peach'),
                 ('Подобрать все', self.auto_pick, 'Purple'), ('Собрать видео', self.render, 'Green')]:
             self.toolbar_items.append(self.button(top, label, command, color))
         for i, widget in enumerate(self.toolbar_items):
@@ -118,6 +133,14 @@ class App:
         self.media_status = ttk.Label(counts, text='Материалы: —', style='Success.TLabel')
         self.media_status.pack(side='left', padx=12)
         self.pattern = tk.StringVar(value='По смыслу рассказа')
+        row = ttk.Frame(outer)
+        row.pack(fill='x', pady=(0, 8))
+        ttk.Label(row, text='Что искать для всего ролика:', style='Heading.TLabel').pack(side='left', padx=(0, 8))
+        self.source_mode = tk.StringVar(value='По смыслу')
+        source_combo = self.combo(row, self.source_mode, list(KINDS), 20)
+        source_combo.pack(side='left')
+        source_combo.bind('<<ComboboxSelected>>', self.change_source_mode)
+        ttk.Label(row, text='Для отдельной сцены источник можно изменить ниже', style='Muted.TLabel').pack(side='left', padx=12)
         self.resolution = tk.StringVar(value='1280×720')
         self.fade = tk.StringVar(value='0')
         self.burn_subs = tk.BooleanVar(value=False)
@@ -195,7 +218,9 @@ class App:
         variants.columnconfigure(0, weight=1)
         variants.rowconfigure(2, weight=1)
         self.kind = tk.StringVar(value='Фото')
-        self.combo(row, self.kind, list(KINDS), 17).pack(side='left')
+        self.scene_source_combo = self.combo(row, self.kind, list(KINDS), 17)
+        self.scene_source_combo.pack(side='left')
+        self.scene_source_combo.bind('<<ComboboxSelected>>', self.change_scene_source)
         self.query = tk.StringVar()
         entry = ttk.Entry(row, textvariable=self.query)
         entry.pack(side='left', fill='x', expand=True, padx=5)
@@ -375,7 +400,7 @@ class App:
         self.project.settings.update(width=int(width), height=int(height), transition=fade,
                                      subtitles=self.burn_subs.get(), allow_external=self.external.get(),
                                      photo_layout=LAYOUTS[self.layout.get()], photo_effect=EFFECTS[self.effect.get()],
-                                     name_titles_enabled=self.names_on.get())
+                                     name_titles_enabled=self.names_on.get(), source_mode=KINDS[self.source_mode.get()])
         self.project.save()
 
     def pick_audio(self):
@@ -387,6 +412,7 @@ class App:
         project.ensure_dirs()
         self.project, self.selected, self.candidate = project, None, None
         self.pattern.set(project.settings['pattern'])
+        self.source_mode.set(LABELS.get(project.settings.get('source_mode'), 'По смыслу'))
         self.resolution.set(f"{project.settings['width']}×{project.settings['height']}")
         self.fade.set(str(project.settings['transition']))
         self.burn_subs.set(project.settings['subtitles'])
@@ -420,10 +446,10 @@ class App:
             self.tree.delete(*self.tree.get_children())
         done = 0
         for i, seg in enumerate(self.project.segments):
-            has_file = bool(seg.get('footage_path') and Path(seg['footage_path']).is_file())
+            has_file = scene_ready(self.project.settings, seg)
             done += has_file
-            values = (timecode(seg['start']), LABELS.get(seg.get('desired_kind'), '?'),
-                      '✓' if has_file else '—', seg['text'])
+            values = (timecode(seg['start']), LABELS.get(effective_source(self.project.settings, seg), '?'),
+                      '✓' if has_file else 'Проверка' if seg.get('footage_path') and Path(seg['footage_path']).is_file() else '—', seg['text'])
             if self.tree.exists(str(i)):
                 self.tree.item(str(i), values=values, tags=('ready' if has_file else 'pending',))
             else:
@@ -457,12 +483,12 @@ class App:
         self.settings()
         project = self.project
         def work():
-            result = transcribe.transcribe_audio(project.audio_path, progress_cb=self.log, split_scenes=False)
+            result = transcribe.transcribe_audio(project.audio_path, progress_cb=self.log, split_scenes=False, cancelled=self.stop.is_set)
             project.set_segments_from_transcript(result['segments'])
             project.raw_transcript = result['segments']
             project.name_titles = []
             project.save()
-        self.task('Транскрибирую…', work)
+        self.task('Распознаю локально…', work, stoppable=True)
 
     def make_plan(self):
         self.settings()
@@ -484,6 +510,32 @@ class App:
         self.refresh()
         self.log('План чередования обновлён. Уже назначенные файлы сохранены.')
 
+    def change_source_mode(self, _event=None):
+        if self.project:
+            for scene in self.project.segments:
+                scene.pop('source_override', None)
+            self.settings()
+            self.refresh()
+            self.select_scene()
+        self.log('Режим источников: ' + self.source_mode.get() + '. Подбор соблюдает этот выбор; файлы на диске сохраняются.')
+
+    def change_scene_source(self, _event=None):
+        if not self.project or self.selected is None:
+            return
+        scene = self.require_scene()
+        previous = effective_source(self.project.settings, scene)
+        kind = KINDS[self.kind.get()]
+        if kind == 'auto':
+            scene.pop('source_override', None)
+        else:
+            scene['source_override'] = kind
+        scene['desired_kind'] = kind
+        if kind != previous:
+            scene['candidates'] = []
+            scene['source_query_dirty'] = kind != 'auto'
+        self.project.save()
+        self.refresh()
+
     def select_scene(self, _event=None):
         if self.busy:
             return
@@ -495,7 +547,7 @@ class App:
         self.candidate = None
         self.scene_label.configure(text=f"Сцена {self.selected + 1} · {timecode(seg['start'])} → {timecode(seg['end'])}\n{seg['text']}")
         self.file_label.configure(text=f"Файл: {seg.get('footage_path') or 'не назначен'}")
-        self.kind.set(LABELS.get(seg.get('desired_kind'), 'По смыслу'))
+        self.kind.set(LABELS.get(effective_source(self.project.settings, seg), 'По смыслу'))
         self.query.set(seg.get('search_query', ''))
         self.source_start.set(str(seg.get('source_start', 0)))
         self.match_label.configure(text='')
@@ -658,15 +710,25 @@ class App:
         if new_query != seg.get('search_query', ''):
             seg['manual_query'] = True
             seg['candidates'] = []
-        if seg.get('desired_kind') != KINDS[self.kind.get()]:
+        changed_source = bool(seg.get('source_query_dirty')) or effective_source(project.settings, seg) != KINDS[self.kind.get()]
+        if changed_source:
             seg['candidates'] = []
         seg.update(desired_kind=KINDS[self.kind.get()], search_query=new_query)
+        if seg['desired_kind'] == 'auto':
+            seg.pop('source_override', None)
+        else:
+            seg['source_override'] = seg['desired_kind']
         project.save()
         if seg['desired_kind'] == 'auto':
             self.auto_pick()
             return
         index = self.selected
         def work():
+            if changed_source and not seg.get('manual_query'):
+                context = ' '.join(s['text'] for s in project.segments[max(0, index - 2):index + 3])
+                seg.update(planner.refine_scene(seg, seg['desired_kind'], context))
+                seg.pop('source_query_dirty', None)
+                project.save()
             media.auto_pick(project, self.log, self.stop.is_set, scene_indices=[index], replace_existing=True,
                            progress=self.auto_progress)
         self.task('Ищу и автоматически добавляю…', work, self.fill_candidates, stoppable=True)
@@ -783,11 +845,13 @@ class App:
         project = self.project
         output = project.project_dir / 'final_video.mp4'
         def work():
-            if any(not s.get('footage_path') or not Path(s['footage_path']).is_file() for s in project.segments):
+            if any(not scene_ready(project.settings, s) for s in project.segments):
                 plan_and_pick(project, self.log, self.stop.is_set, self.auto_progress)
             if self.stop.is_set():
                 return
             self.events.put(('render_phase', None))
+            if any(not scene_ready(project.settings, s) for s in project.segments):
+                raise ValueError('Подбор или проверка содержимого не завершены. Проверьте журнал и повторите автоподбор.')
             render.build_video(project.segments, project.audio_path, output,
                                project.settings, self.log, name_titles=project.name_titles)
         self.task('Подготавливаю и собираю…', work,
@@ -800,42 +864,37 @@ class App:
         values = dotenv_values(path) if path.exists() else {}
         win = self.tk.Toplevel(self.root)
         win.configure(bg=self.colors.BG)
-        win.title('API-ключи — хранятся локально в .env')
+        win.title('Анализ рассказа, локальное распознавание и ключи стоков')
         win.transient(self.root)
         win.grab_set()
         frame = self.ttk.Frame(win, padding=16)
         frame.pack(fill='both', expand=True)
         variables = {}
-        for i, key in enumerate(('FASTGEN_API_KEY', 'PEXELS_API_KEY', 'PIXABAY_API_KEY')):
-            self.ttk.Label(frame, text=key).grid(row=i, column=0, sticky='w', pady=5)
-            variable = self.tk.StringVar(value=values.get(key) or os.getenv(key, ''))
+        fields = [('SCENEMIX_AI_PROVIDER', 'Анализ смысла', 'openai', ['openai', 'ollama']),
+                  ('OPENAI_API_KEY', 'Ключ OpenAI', '', None),
+                  ('OPENAI_MODEL', 'Модель OpenAI с изображениями', 'gpt-4.1-mini', ['gpt-4.1-mini', 'gpt-4.1', 'gpt-4o']),
+                  ('OLLAMA_BASE_URL', 'Адрес локальной Ollama', 'http://localhost:11434/v1', None),
+                  ('OLLAMA_MODEL', 'Модель Ollama с изображениями', 'gemma3:4b', ['gemma3:4b', 'gemma3:12b']),
+                  ('WHISPER_MODEL', 'Локальное распознавание', 'small', ['small', 'medium', 'large-v3']),
+                  ('WHISPER_LANGUAGE', 'Язык речи (пусто — авто)', 'ru', None),
+                  ('PEXELS_API_KEY', 'Ключ Pexels (стоки)', '', None),
+                  ('PIXABAY_API_KEY', 'Ключ Pixabay (стоки)', '', None)]
+        for i, (key, label, default, choices) in enumerate(fields):
+            self.ttk.Label(frame, text=label).grid(row=i, column=0, sticky='w', pady=5)
+            variable = self.tk.StringVar(value=values.get(key) if key in values else os.getenv(key, default))
             variables[key] = variable
-            self.ttk.Entry(frame, textvariable=variable, show='•', width=44).grid(row=i, column=1, padx=8, pady=5)
-        self.ttk.Label(frame, text='Текстовая модель').grid(row=3, column=0, sticky='w', pady=5)
-        model = self.tk.StringVar(value=values.get('FASTGEN_TEXT_MODEL') or os.getenv('FASTGEN_TEXT_MODEL', ''))
-        variables['FASTGEN_TEXT_MODEL'] = model
-        models = self.ttk.Combobox(frame, textvariable=model, width=41)
-        models.grid(row=3, column=1, padx=8, pady=5)
-        model_result = {}
-        def fetch_models():
-            import fastgen_text
-            key = variables['FASTGEN_API_KEY'].get().strip()
-            if not key:
-                self.message.showerror('Нет ключа', 'Введите ключ Fast-gen в поле выше.', parent=win)
-                return
-            def work():
-                model_result['models'] = fastgen_text.available_models(api_key=key)
-            def done():
-                if win.winfo_exists():
-                    models.configure(values=model_result['models'])
-                    if not model.get():
-                        model.set(model_result['models'][0])
-                    models.focus_set()
-            self.task('Получаю список текстовых моделей…', work, done)
-        self.ttk.Button(frame, text='Получить список моделей', command=fetch_models).grid(row=4, column=1, sticky='w', padx=8)
-        self.ttk.Label(frame, text='Пустая модель — автоматический выбор из доступных в вашем аккаунте.\n'
-                       'Можно выбрать из списка или вписать ID текстовой модели Fast-gen.\n'
-                       'Ключи хранятся локально; значения скрыты в журнале и GitHub.').grid(row=5, column=0, columnspan=2, pady=12)
+            if choices:
+                field = self.ttk.Combobox(frame, textvariable=variable, values=choices, width=39,
+                                           state='readonly' if key == 'SCENEMIX_AI_PROVIDER' else 'normal')
+            else:
+                field = self.ttk.Entry(frame, textvariable=variable, show='•' if key.endswith('API_KEY') else '', width=42)
+            field.grid(row=i, column=1, padx=8, pady=5)
+        self.ttk.Label(frame, text='OpenAI: прямое подключение, использование API оплачивается отдельно.\n'
+                       'Ollama: запустите приложение и установите gemma3:4b (нужна поддержка изображений).\n'
+                       'Whisper распознаёт на ноутбуке; первый запуск скачивает модель.\n'
+                       'OpenAI получает текст и изображения для проверки; аудио остаётся на ноутбуке.\n'
+                       'Ключи хранятся локально.',
+                       wraplength=620).grid(row=len(fields), column=0, columnspan=2, pady=12)
         def save():
             if not path.exists():
                 path.touch(mode=0o600)
@@ -843,14 +902,13 @@ class App:
                 value = variable.get().strip()
                 set_key(str(path), key, value)
                 os.environ[key] = value
-                for module in (media.photo, media.footage, transcribe):
-                    if hasattr(module, key):
-                        setattr(module, key, value or None)
+                if hasattr(media.footage, key):
+                    setattr(media.footage, key, value or None)
             if os.name != 'nt':
                 path.chmod(0o600)
-            self.log('Настройки ключей сохранены локально. Значения скрыты.')
+            self.log('Настройки анализа, распознавания и стоков сохранены локально.')
             win.destroy()
-        self.ttk.Button(frame, text='Сохранить', command=save, style='Green.TButton').grid(row=6, column=1, sticky='e')
+        self.ttk.Button(frame, text='Сохранить', command=save, style='Green.TButton').grid(row=len(fields)+1, column=1, sticky='e')
 
     def scene_style(self):
         seg = self.require_scene()
@@ -984,7 +1042,9 @@ def main():
             parser.error('Сохранённый проект не найден')
         if args.autopick:
             plan_and_pick(project)
-            return 0 if all(s.get('footage_path') and Path(s['footage_path']).is_file() for s in project.segments) else 1
+            return 0 if all(scene_ready(project.settings, s) for s in project.segments) else 1
+        if any(not scene_ready(project.settings, s) for s in project.segments):
+            raise ValueError('Материалы не соответствуют выбранному источнику. Запустите автоподбор.')
         render.build_video(project.segments, project.audio_path, project.project_dir / 'final_video.mp4',
                            project.settings, name_titles=project.name_titles)
         return 0

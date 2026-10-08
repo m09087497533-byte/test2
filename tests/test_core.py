@@ -13,6 +13,13 @@ from subtitles import import_subtitle_file
 
 
 class CoreTests(unittest.TestCase):
+    def setUp(self):
+        verifier = patch('media.visual_match.verify_file', return_value={
+            'compatible': True, 'relevance_score': 0.9, 'relevance_reason': 'Verified test fixture',
+            'visual_verified': True, 'relevance_basis': 'downloaded_visual_and_metadata'})
+        verifier.start()
+        self.addCleanup(verifier.stop)
+
     def test_pattern_persistence_and_legacy(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Project(Path(tmp) / 'voice.wav')
@@ -101,7 +108,8 @@ class CoreTests(unittest.TestCase):
             p.segments[1]['desired_kind'] = 'photo'
             candidates = [{'id': 'bad', 'provider': 'web', 'media_kind': 'photo'},
                           {'id': 'good', 'provider': 'web', 'media_kind': 'photo'}]
-            with patch.object(media, 'search', return_value=(candidates, [])), \
+            with patch.object(media, 'semantic_query', return_value='test subject'), \
+                 patch.object(media, 'search', return_value=(candidates, [])), \
                  patch.object(media, 'download', side_effect=[RuntimeError('bad file'), found]) as download:
                 self.assertEqual(media.auto_pick(p, log=lambda _: None), 1)
                 self.assertEqual(download.call_count, 2)

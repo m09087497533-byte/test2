@@ -13,6 +13,8 @@ from ddgs import DDGS
 import photo
 import footage
 from search_policy import SearchPolicy, rank_candidates, rank_search_metadata
+from project import effective_source, requested_source, source_matches, scene_ready
+import visual_match
 
 
 def safe_url(url):
@@ -81,8 +83,6 @@ def search(seg, kind=None, context='', limit=6, policy=None, fresh=False):
     if kind == 'stock' and seg.get('query_en') and not seg.get('manual_query'):
         query = seg['query_en']
     warnings = []
-    if not photo.FASTGEN_API_KEY and not seg.get('search_query'):
-        warnings.append('FASTGEN_API_KEY не задан: используется перевод текста вместо LLM-планирования.')
     results = []
     cache_query = f'{query}|limit={limit}'
     if kind == 'photo':
@@ -155,6 +155,11 @@ def search(seg, kind=None, context='', limit=6, policy=None, fresh=False):
                                 '); выбираю по поисковой выдаче и названиям, без ручного выбора.')
     elif results:
         results = rank_search_metadata(seg, results)
+    if seg.get('strict_relevance') and results:
+        try:
+            results = visual_match.rank_previews({**seg, 'context': context}, results)
+        except Exception:
+            warnings.append('Проверка превью недоступна; каждый скачанный материал будет проверен перед назначением.')
     return results, warnings
 
 
@@ -260,15 +265,15 @@ def _candidate_score(candidate):
         return 0.0
 
 
-def _search_attempts(seg, context, allow_external):
+def _search_attempts(seg, context, allow_external, required=None):
     """Keep named subjects while changing query language or falling back to photos."""
     primary = semantic_query(seg, context).strip()
     queries = list(dict.fromkeys(q for q in (primary, str(seg.get('query_en') or '').strip(),
                          str(seg.get('subject') or '').strip()) if q))
-    kind = seg.get('desired_kind', 'photo')
-    kinds = [kind] if kind == 'photo' else [kind, 'photo']
+    kind = required or seg.get('desired_kind', 'photo')
+    kinds = [kind] if required or kind == 'photo' else [kind, 'photo']
     if kind in ('youtube', 'web') and not allow_external:
-        kinds = ['photo']
+        kinds = [] if required else ['photo']
     for source in kinds:
         source_queries = queries
         if source == 'stock' and seg.get('query_en'):
@@ -278,7 +283,7 @@ def _search_attempts(seg, context, allow_external):
             yield source, query
 
 
-def _try_candidates(project, index, candidates, attempted, log, cancelled):
+def _try_candidates(project, index, candidates, attempted, log, cancelled, policy=None):
     seg = project.segments[index]
     # The best relative match is tried first, including scores below the former 80% gate.
     candidates = sorted(candidates, key=_candidate_score, reverse=True)
@@ -292,6 +297,8 @@ def _try_candidates(project, index, candidates, attempted, log, cancelled):
         if candidate.get('compatible') is False:
             continue
         candidate.setdefault('media_kind', 'photo' if candidate.get('photo_url') else 'video')
+        if not source_matches(project.settings, seg, candidate):
+            continue
         external = candidate['provider'] in ('youtube', 'webvideo')
         if external and not project.settings['allow_external']:
             continue
@@ -318,6 +325,20 @@ def _try_candidates(project, index, candidates, attempted, log, cancelled):
                             start, project.settings['allow_external'])
             if cancelled():
                 return False
+            if project.settings.get('visual_verification', True):
+                try:
+                    checked = visual_match.verify_file(seg, candidate, path)
+                except Exception as exc:
+                    if policy:
+                        policy.visual_error = True
+                    log('Проверка содержимого недоступна: ' + str(exc) + '. Материал не назначен; повторите автоподбор после восстановления анализа.')
+                    return False
+                if cancelled():
+                    return False
+                candidate.update(checked)
+                if not checked['compatible']:
+                    log('Материал не соответствует рассказу: ' + checked.get('relevance_reason', '') + '. Пробую следующий.')
+                    continue
             fingerprint = None
             if candidate.get('media_kind') == 'photo':
                 fingerprint = photo_fingerprint(path)
@@ -342,6 +363,9 @@ def _try_candidates(project, index, candidates, attempted, log, cancelled):
                     log('Повтор изображения пропущен; выбираю следующее фото.')
                     continue
             project.assign(index, path, candidate, 0.0)
+            seg.update(visual_verified=candidate.get('visual_verified', False),
+                       relevance_basis=candidate.get('relevance_basis', ''),
+                       relevance_reason=candidate.get('relevance_reason', ''))
             actual_kind = ('photo' if candidate.get('media_kind') == 'photo' else
                            'youtube' if candidate['provider'] == 'youtube' else 'web' if external else 'stock')
             if actual_kind != seg.get('desired_kind'):
@@ -366,24 +390,60 @@ def _try_candidates(project, index, candidates, attempted, log, cancelled):
 def auto_pick(project, log=print, cancelled=lambda: False, scene_indices=None, replace_existing=False, progress=None):
     assigned = 0
     policy = SearchPolicy(project.project_dir)
+    policy.visual_error = False
     indices = list(range(len(project.segments))) if scene_indices is None else list(scene_indices)
-    if any(project.segments[i].get('desired_kind') == 'auto' for i in indices):
+    if any(effective_source(project.settings, project.segments[i]) == 'auto' for i in indices):
         raise RuntimeError('Сначала создайте смысловой план рассказа. Случайное чередование отключено.')
     for i in indices:
         seg = project.segments[i]
         if cancelled():
             break
-        if seg.get('footage_path') and Path(seg['footage_path']).is_file() and not replace_existing:
-            continue
+        if seg.get('footage_path') and Path(seg['footage_path']).is_file() and source_matches(project.settings, seg) and not replace_existing:
+            if scene_ready(project.settings, seg):
+                continue
+            candidate = {'id': seg.get('selected_candidate_id') or stable_id(seg['footage_path']),
+                         'provider': seg.get('footage_source', 'local'), 'media_kind': seg.get('media_kind'),
+                         'title': seg.get('title', ''), 'source_url': seg.get('source_url', '')}
+            try:
+                checked = visual_match.verify_file(seg, candidate, seg['footage_path'])
+            except Exception as exc:
+                log('Не удалось проверить прежний материал: ' + str(exc))
+                seg['auto_pick_status'] = 'verification_unavailable'
+                project.save()
+                break
+            if cancelled():
+                break
+            seg.update(checked)
+            if checked['compatible']:
+                project.save()
+                continue
+            seg['visual_verified'] = False
+            seg['review_status'] = 'rejected_content'
+            for old in seg.get('candidates', []):
+                if old.get('id') == candidate['id']:
+                    old['compatible'] = False
+            log('Прежний материал не соответствует рассказу; ищу замену автоматически.')
+        seg['desired_kind'] = effective_source(project.settings, seg)
         context = ' '.join(s['text'] for s in project.segments[max(0, i - 1):i + 2])
+        if seg.get('source_query_dirty') and not seg.get('manual_query'):
+            from planner import refine_scene
+            try:
+                seg.update(refine_scene(seg, seg['desired_kind'], context))
+                seg.pop('source_query_dirty', None)
+                project.save()
+            except Exception as exc:
+                log('Не удалось уточнить запрос для выбранного источника: ' + str(exc))
+                seg['auto_pick_status'] = 'verification_unavailable'
+                project.save()
+                break
         attempted, merged = set(), list(seg.get('candidates', []))
         refresh_search = bool(merged)
         seg['auto_pick_status'] = 'searching'
         # Reuse previously found results, including those previously rejected only for a low score.
-        success = _try_candidates(project, i, merged, attempted, log, cancelled)
-        if not success and not cancelled():
+        success = _try_candidates(project, i, merged, attempted, log, cancelled, policy)
+        if not success and not cancelled() and not policy.visual_error:
             try:
-                attempts = _search_attempts(seg, context, project.settings['allow_external'])
+                attempts = _search_attempts(seg, context, project.settings['allow_external'], requested_source(project.settings, seg))
                 for kind, query in attempts:
                     if cancelled():
                         break
@@ -401,27 +461,29 @@ def auto_pick(project, log=print, cancelled=lambda: False, scene_indices=None, r
                     merged.extend(c for c in candidates if _candidate_key(c) not in known)
                     seg['candidates'] = merged
                     project.save()
-                    success = _try_candidates(project, i, candidates, attempted, log, cancelled)
-                    if success:
+                    success = _try_candidates(project, i, candidates, attempted, log, cancelled, policy)
+                    if success or policy.visual_error:
                         break
             except Exception as exc:
                 log(f'Сцена {i + 1}: поиск недоступен ({type(exc).__name__}).')
         if success:
             assigned += 1
-        elif seg.get('footage_path') and Path(seg['footage_path']).is_file():
+        elif scene_ready(project.settings, seg):
             seg['auto_pick_status'] = 'assigned'
             project.save()
         elif not cancelled():
-            seg.update(auto_pick_status='temporarily_unavailable',
+            seg.update(auto_pick_status='verification_unavailable' if policy.visual_error else 'temporarily_unavailable',
                        auto_pick_error='Источники не вернули доступный файл после расширенного поиска.')
             log(f'Сцена {i + 1}: источники сейчас недоступны. Повторный автоподбор продолжит эту сцену.')
             project.save()
         if progress:
-            ready = sum(bool(s.get('footage_path') and Path(s['footage_path']).is_file()) for s in project.segments)
+            ready = sum(scene_ready(project.settings, s) for s in project.segments)
             progress(ready, len(project.segments))
+        if policy.visual_error:
+            break
     if cancelled():
         log('Остановлено. Готовые сцены сохранены.')
-    ready = sum(bool(s.get('footage_path') and Path(s['footage_path']).is_file()) for s in project.segments)
+    ready = sum(scene_ready(project.settings, s) for s in project.segments)
     log(f'Результат автоподбора: {ready}/{len(project.segments)} сцен заполнено; новых назначений: {assigned}. '
         f'Временно недоступных: {len(project.segments) - ready}.')
     return assigned

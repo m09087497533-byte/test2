@@ -1,7 +1,10 @@
 python-dotenv>=1.0,<2
 Pillow>=10,<13
-deep-translator>=1.11,<2
 requests>=2.32,<3
 ddgs>=9,<10
 pytesseract>=0.3.13,<0.4
 yt-dlp[default,deno]>=2026.3.17
+faster-whisper>=1.2.1,<2
+# Wheels for both Intel and Apple Silicon on macOS 13+
+av==15.1.0
+onnxruntime==1.20.1
