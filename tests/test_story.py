@@ -50,7 +50,7 @@ class StoryTests(unittest.TestCase):
         groups = {'scenes': [{'first': 0, 'last': n - 1, 'kind': 'photo', 'subject': 'Ольга Корбут',
                              'query': 'Ольга Корбут портрет', 'reason': 'Человек', 'effect': 'slide_up'}]}
         with patch('planner.llm_json', side_effect=[overview, groups]):
-            result = plan_story(transcript, log=lambda _: None)
+            result = plan_story(transcript, {'analysis_mode':'ai'}, log=lambda _: None)
         self.assertEqual([s['desired_kind'] for s in result['segments']], ['photo', 'photo'])
         self.assertTrue(all(s['subject'] == 'Ольга Корбут' for s in result['segments']))
         self.assertEqual(' '.join(s['text'] for s in result['segments']), transcript[0]['text'])

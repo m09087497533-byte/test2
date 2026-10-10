@@ -125,7 +125,7 @@ class TextClientTests(unittest.TestCase):
             before = project.project_file.read_bytes()
             with patch.object(client.requests, 'request', return_value=chat('not JSON')) as request:
                 with self.assertRaisesRegex(client.TextServiceError, 'повторной попытки'):
-                    plan_story(project.segments, log=lambda _: None)
+                    plan_story(project.segments, {'analysis_mode':'ai'}, log=lambda _: None)
             self.assertEqual(request.call_count, 2)
             self.assertEqual(project.project_file.read_bytes(), before)
             self.assertEqual(Path(project.segments[0]['footage_path']), portrait)

@@ -69,17 +69,15 @@ def semantic_query(seg, context=''):
     manual = seg.get('search_query', '').strip()
     if manual:
         return manual
-    text = seg['text']
-    if context:
-        text = f'Context: {context[:700]}\nScene to illustrate: {text}'
-    return photo.generate_scene_query(text)
+    from context_search import scene_query
+    return scene_query(seg['text'], context, seg.get('desired_kind', 'photo'))['search_query']
 
 
 def search(seg, kind=None, context='', limit=6, policy=None, fresh=False):
     kind = kind or seg.get('desired_kind', 'photo')
     query = semantic_query(seg, context)
     if kind == 'auto':
-        raise RuntimeError('Сначала нажмите «Смысловой план»: источник выбирается по рассказу.')
+        raise RuntimeError('Сначала нажмите «Подготовить сцены»: источник выбирается по контексту рассказа.')
     if kind == 'stock' and seg.get('query_en') and not seg.get('manual_query'):
         query = seg['query_en']
     warnings = []
@@ -98,7 +96,7 @@ def search(seg, kind=None, context='', limit=6, policy=None, fresh=False):
         providers = [(footage.PEXELS_API_KEY, footage._search_pexels, 'Pexels'),
                      (footage.PIXABAY_API_KEY, footage._search_pixabay, 'Pixabay')]
         if not any(p[0] for p in providers):
-            raise RuntimeError('Для стоков добавьте PEXELS_API_KEY или PIXABAY_API_KEY в .env')
+            raise RuntimeError('Для стоков добавьте PEXELS_API_KEY или PIXABAY_API_KEY в «Ключи стоков».')
         for key, function, name in providers:
             if not key:
                 continue
@@ -141,7 +139,7 @@ def search(seg, kind=None, context='', limit=6, policy=None, fresh=False):
         item['query'] = query
     if not results:
         warnings.append('По этому запросу результатов нет; автоподбор попробует другой запрос.')
-    if seg.get('strict_relevance') and results:
+    if seg.get('strict_relevance') and seg.get('analysis_mode') == 'ai' and results:
         if policy and not policy.metadata_ranker_available:
             results = rank_search_metadata(seg, results)
         else:
@@ -154,8 +152,9 @@ def search(seg, kind=None, context='', limit=6, policy=None, fresh=False):
                 warnings.append('Оценка текстовой модели недоступна (' + type(exc).__name__ +
                                 '); выбираю по поисковой выдаче и названиям, без ручного выбора.')
     elif results:
-        results = rank_search_metadata(seg, results)
-    if seg.get('strict_relevance') and results:
+        from context_search import rank_results
+        results = rank_results(seg, results)
+    if seg.get('strict_relevance') and seg.get('analysis_mode') == 'ai' and results:
         try:
             results = visual_match.rank_previews({**seg, 'context': context}, results)
         except Exception:
@@ -203,7 +202,7 @@ def suggest_start(candidate, seg):
                 events.append({'start': e.get('tStartMs', 0) / 1000, 'text': text})
         clip_duration = min(8.0, seg['end'] - seg['start'])
         result = rank_caption_window(events, seg['text'], clip_duration, candidate.get('query', ''))
-        if result and seg.get('strict_relevance'):
+        if result and seg.get('strict_relevance') and seg.get('analysis_mode') == 'ai':
             from planner import llm_json
             judged = llm_json('Is this exact subtitle passage a relevant illustrative interval for the narration? '
                 'Return JSON {"relevant":true|false,"reason":"..."}. '
@@ -285,6 +284,10 @@ def _search_attempts(seg, context, allow_external, required=None):
 
 def _try_candidates(project, index, candidates, attempted, log, cancelled, policy=None):
     seg = project.segments[index]
+    if project.settings.get('analysis_mode', 'basic') == 'basic' and any(
+            c.get('title') or c.get('source_url') for c in candidates):
+        from context_search import rank_results
+        candidates = rank_results(seg, candidates)
     # The best relative match is tried first, including scores below the former 80% gate.
     candidates = sorted(candidates, key=_candidate_score, reverse=True)
     for candidate in candidates:
@@ -379,7 +382,7 @@ def _try_candidates(project, index, candidates, attempted, log, cancelled, polic
                 seg['photo_fingerprint'] = fingerprint
             project.save()
             score = _candidate_score(candidate)
-            note = f', оценка {score:.0%}' if candidate.get('relevance_score') is not None else ''
+            note = f', совпадение слов {score:.0%}' if candidate.get('relevance_score') is not None else ''
             log(f'Сцена {index + 1}/{len(project.segments)}: {candidate["provider"]}{note}, автоматически добавлено.')
             return True
         except Exception as exc:
@@ -396,6 +399,7 @@ def auto_pick(project, log=print, cancelled=lambda: False, scene_indices=None, r
         raise RuntimeError('Сначала создайте смысловой план рассказа. Случайное чередование отключено.')
     for i in indices:
         seg = project.segments[i]
+        seg['analysis_mode'] = project.settings.get('analysis_mode', 'basic')
         if cancelled():
             break
         if seg.get('footage_path') and Path(seg['footage_path']).is_file() and source_matches(project.settings, seg) and not replace_existing:
@@ -424,11 +428,11 @@ def auto_pick(project, log=print, cancelled=lambda: False, scene_indices=None, r
                     old['compatible'] = False
             log('Прежний материал не соответствует рассказу; ищу замену автоматически.')
         seg['desired_kind'] = effective_source(project.settings, seg)
-        context = ' '.join(s['text'] for s in project.segments[max(0, i - 1):i + 2])
+        context = ' '.join(s['text'] for s in project.segments[max(0, i - 2):i])
         if seg.get('source_query_dirty') and not seg.get('manual_query'):
             from planner import refine_scene
             try:
-                seg.update(refine_scene(seg, seg['desired_kind'], context))
+                seg.update(refine_scene(seg, seg['desired_kind'], context, project.settings.get('analysis_mode', 'basic')))
                 seg.pop('source_query_dirty', None)
                 project.save()
             except Exception as exc:

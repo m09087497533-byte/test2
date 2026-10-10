@@ -1,4 +1,4 @@
-"""План монтажа по рассказу. LLM выбирает границы и источники, не придумывает таймкоды."""
+"""План монтажа по контекстным правилам; границы берутся из транскрипции."""
 import copy
 import json
 import math
@@ -16,7 +16,12 @@ def llm_json(prompt):
     return json_object(prompt)
 
 
-def refine_scene(scene, kind, context):
+def refine_scene(scene, kind, context, analysis_mode="basic"):
+    if analysis_mode == "basic":
+        from context_search import scene_query
+        value = scene_query(scene["text"], context, kind)
+        value.pop("_state", None)
+        return value
     value = llm_json('Build an exact documentary visual search for source=' + kind + '. '
         'Return JSON {"query":"precise query in narration language", "query_en":"English query", '
         '"must_match":["visible subjects/actions/era"], "avoid":["wrong content"], '
@@ -214,12 +219,79 @@ def rebalance_scenes(scenes, min_scene=6.0, photo_max=14.0, video_max=8.0):
     return result
 
 
+def _plan_basic(segments, settings, log, cancelled):
+    from context_search import people, scene_query
+    words = timed_words(segments)
+    # Rules need the whole utterance: splitting every 3.5 seconds could separate
+    # a person's name from the event, or a location from the following action.
+    cue_ends, count = set(), 0
+    for seg in segments:
+        count += len(seg.get('words') or seg['text'].split())
+        cue_ends.add(count)
+    units, utterance = [], []
+    for index, word in enumerate(words, 1):
+        utterance.append(word)
+        if index in cue_ends or (len(utterance) >= 2 and re.search(r'[.!?…][»"\)]*$', word['text'])):
+            units.append({'text': ' '.join(w['text'] for w in utterance), 'words': utterance,
+                          'start': utterance[0]['start'], 'end': utterance[-1]['end']})
+            utterance = []
+    if utterance:
+        units.append({'text': ' '.join(w['text'] for w in utterance), 'words': utterance,
+                      'start': utterance[0]['start'], 'end': utterance[-1]['end']})
+    entities = {}
+    for seg in segments:
+        for entity in people(seg['text']):
+            old = entities.setdefault(entity['name'], {'name': entity['name'], 'aliases': []})
+            old['aliases'] = list(dict.fromkeys(old['aliases'] + entity['aliases']))
+    mode = settings.get('source_mode', 'auto')
+    if mode not in ('auto', 'photo', 'stock', 'youtube', 'web'):
+        raise ValueError('Неизвестный источник.')
+    planned, current, state = [], [], {}
+    current_kind, current_person = None, None
+    def flush():
+        if not current:
+            return
+        text = ' '.join(u['text'] for u in current)
+        context = ' '.join(s['text'] for s in segments if s['end'] >= current[0]['start'] - 15 and s['end'] <= current[0]['start'])
+        metadata = scene_query(text, context, current_kind, current[0]['context_state'])
+        metadata.pop('_state', None)
+        planned.append({**metadata, 'start': current[0]['start'], 'end': current[-1]['end'],
+                        'text': text, 'words': [w for u in current for w in u['words']],
+                        'desired_kind': current_kind, 'photo_layout': 'auto',
+                        'effect': settings.get('photo_effect', 'slide_up'), 'review_status': 'unassigned'})
+        current.clear()
+    for unit in units:
+        if cancelled():
+            raise RuntimeError('Подготовка остановлена; прежний проект сохранён.')
+        metadata = scene_query(unit['text'], '', 'photo', state)
+        person = metadata['_state']['person']
+        kind = mode if mode != 'auto' else ('photo' if person else 'stock' if metadata['must_match'] else 'photo')
+        cap = settings['photo_max'] if kind == 'photo' else settings['video_max']
+        if current and (kind != current_kind or person != current_person or unit['end'] - current[0]['start'] > cap):
+            flush()
+        if current and current[-1]['end'] - current[0]['start'] >= settings['min_scene'] and metadata['must_match'] != current[-1]['concepts']:
+            flush()
+        if not current:
+            current_kind, current_person = kind, person
+        current.append({**unit, 'context_state': dict(state), 'concepts': metadata['must_match']})
+        state = metadata['_state']
+    flush()
+    scenes = rebalance_scenes(planned, settings['min_scene'], settings['photo_max'], settings['video_max'])
+    titles = mention_titles(words, list(entities.values()))
+    log(f'Подготовлено {len(scenes)} сцен: имя, тема, действие и соседние реплики. Анализ кадров не выполняется.')
+    return {'segments': scenes, 'story': {'summary': ' '.join(s['text'] for s in segments)[:1500],
+            'entities': list(entities.values()), 'analysis_basis': 'context_rules'},
+            'name_titles': titles, 'raw_transcript': copy.deepcopy(segments)}
+
+
 def plan_story(segments, settings=None, log=print, cancelled=lambda: False):
     segments, repairs = normalize_segment_timing(segments)
     settings = {**DEFAULTS, **(settings or {})}
     source_mode = settings.get('source_mode', 'auto')
     if source_mode not in ('auto', 'photo', 'stock', 'youtube', 'web'):
         raise ValueError('Неизвестный режим источников.')
+    if settings.get('analysis_mode', 'basic') == 'basic':
+        return _plan_basic(segments, settings, log, cancelled)
     original = copy.deepcopy(segments)
     # Check/repair word boundaries before spending requests on a long story.
     words = timed_words(segments)
@@ -341,7 +413,7 @@ def save_plan(project, result):
         backup.write_bytes(project.project_file.read_bytes())
     project.segments = segments
     project.story = result['story']
-    project.story['planner_version'] = 4
+    project.story['planner_version'] = 5 if project.settings.get('analysis_mode', 'basic') == 'basic' else 4
     project.story['source_mode'] = project.settings.get('source_mode', 'auto')
     project.name_titles = result['name_titles']
     project.raw_transcript = result['raw_transcript']

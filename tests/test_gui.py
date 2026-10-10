@@ -90,6 +90,33 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.app.kind.get(), 'Стоки')
         self.assertEqual(self.app.tree.item('0', 'values')[1], 'Стоки')
 
+    def test_audio_automatically_imports_sidecar_subtitles_without_recognition(self):
+        audio = Path(self.tmp.name) / 'new_voice.wav'
+        audio.with_suffix('.srt').write_text(
+            '1\n00:00:00,000 --> 00:00:06,000\nОльга Корбут выступила.\n', encoding='utf-8')
+        with patch.object(self.app.dialog, 'askopenfilename', return_value=str(audio)), \
+             patch.object(self.app.message, 'showerror') as error:
+            self.app.pick_audio()
+            self.root.update()
+        error.assert_not_called()
+        self.assertEqual(self.app.project.raw_transcript[0]['text'], 'Ольга Корбут выступила.')
+        self.assertEqual(len(self.app.tree.get_children()), 1)
+        self.assertTrue(self.app.project.project_file.exists())
+
+    def test_existing_transcript_is_preserved_even_when_sidecar_differs(self):
+        self.app.project.audio_path.with_suffix('.srt').write_text(
+            '1\n00:00:00,000 --> 00:00:06,000\nДругой текст.\n', encoding='utf-8')
+        self.app.project.save()
+        with patch.object(self.app.dialog, 'askopenfilename', return_value=str(self.app.project.audio_path)):
+            self.app.pick_audio()
+            self.root.update()
+        self.assertEqual(self.app.project.segments[0]['text'], 'train')
+
+    def test_toolbar_offers_original_file_workflow_without_ai_or_model_download(self):
+        labels = [widget.cget('text') for widget in self.app.toolbar_items]
+        self.assertIn('Ключи стоков', labels)
+        self.assertFalse(any('AI' in label or 'Распознать' in label for label in labels))
+
     def test_scene_source_choice_persists_before_search_button_is_pressed(self):
         from project import Project
         self.app.kind.set('Стоки')

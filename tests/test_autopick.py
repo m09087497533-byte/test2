@@ -132,7 +132,7 @@ class AutomaticSelectionTests(unittest.TestCase):
         self.assertEqual(self.scene['auto_pick_status'], 'temporarily_unavailable')
         self.assertFalse(any('требуют выбора' in line or 'укажите вручную' in line for line in logs))
 
-    def test_model_ranking_failure_keeps_automatic_search_working_and_does_not_repeat_api_failure(self):
+    def test_basic_search_never_calls_text_model_even_with_legacy_strict_flag(self):
         candidates = [{'id': 'unrelated', 'provider': 'web', 'title': 'Night city', 'photo_url': 'https://example.com/city.jpg'},
                       {'id': 'person', 'provider': 'web', 'title': 'Ольга Корбут 1972', 'photo_url': 'https://example.com/person.jpg'}]
         policy = SearchPolicy(self.project.project_dir)
@@ -140,11 +140,11 @@ class AutomaticSelectionTests(unittest.TestCase):
              patch.object(media, 'rank_candidates', side_effect=RuntimeError('API offline')) as rank:
             first, warnings = media.search(self.scene, policy=policy)
             second, _ = media.search(self.scene, policy=policy)
-        self.assertEqual(rank.call_count, 1)
+        self.assertEqual(rank.call_count, 0)
         self.assertEqual(first[0]['id'], 'person')
         self.assertEqual(second[0]['id'], 'person')
-        self.assertTrue(warnings)
-        self.assertEqual(first[0]['relevance_basis'], 'search_order_and_title_keywords')
+        self.assertFalse(warnings)
+        self.assertEqual(first[0]['relevance_basis'], 'context_and_source_keywords')
 
     def test_bigger_search_pool_not_hidden_by_old_six_result_cache(self):
         policy = SearchPolicy(self.project.project_dir)

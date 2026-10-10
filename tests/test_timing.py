@@ -173,7 +173,7 @@ class TimingTests(unittest.TestCase):
             return {'scenes': [{'first': u['id'], 'last': u['id'], 'kind': 'photo',
                                 'subject': u['text'], 'query': u['text']} for u in units]}
         with patch('planner.llm_json', side_effect=respond):
-            result = plan_story(transcript, log=lambda _: None)
+            result = plan_story(transcript, {'analysis_mode':'ai'}, log=lambda _: None)
         validate_segments(result['segments'])
         self.assertEqual(len(result['segments']), 1063)
         self.assertEqual(' '.join(s['text'] for s in result['segments']), ' '.join(s['text'] for s in transcript))

@@ -27,6 +27,7 @@ class SelectionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.p = Project(Path(self.tmp.name) / 'voice.wav')
+        self.p.settings.update(analysis_mode='ai', visual_verification=True)
         self.p.set_segments_from_transcript([{'text': 'Ольга Корбут выступает на брусьях.', 'start': 0, 'end': 7}])
         self.s = self.p.segments[0]
         self.s.update(desired_kind='photo', search_query='Ольга Корбут брусья', query_en='Olga Korbut uneven bars', subject='Ольга Корбут')
@@ -64,6 +65,7 @@ class SelectionTests(unittest.TestCase):
         self.p.save()
         loaded = Project(self.p.audio_path)
         loaded.load()
+        loaded.settings.update(analysis_mode='ai',visual_verification=True)
         self.assertEqual(effective_source(loaded.settings, loaded.segments[0]), 'stock')
         with patch.object(media, 'download', return_value=self.video) as download, \
              patch.object(media.visual_match, 'verify_file', return_value=checked()):
@@ -133,7 +135,7 @@ class SelectionTests(unittest.TestCase):
         n = len(planner.units_from_words(planner.timed_words([self.s])))
         with patch.object(planner, 'llm_json', side_effect=[{'summary': 'Gymnast', 'entities': []},
                 {'scenes': [{'first': 0, 'last': n-1, 'kind': 'photo', 'query': 'gymnast uneven bars', 'subject': 'gymnast'}]}]):
-            result = planner.plan_story([self.s], {'source_mode': 'stock'}, log=lambda _: None)
+            result = planner.plan_story([self.s], {'source_mode': 'stock', 'analysis_mode':'ai'}, log=lambda _: None)
         self.assertTrue(all(s['desired_kind'] == 'stock' for s in result['segments']))
         self.assertTrue(all(s['depiction'] == 'illustrative' for s in result['segments']))
 
@@ -147,7 +149,7 @@ class SelectionTests(unittest.TestCase):
         with patch.object(planner, 'llm_json', return_value={'query': 'гимнастка брусья',
                 'query_en': 'gymnast training uneven bars', 'must_match': ['uneven bars'],
                 'required_entities': ['Ольга Корбут']}) as client:
-            result = planner.refine_scene(self.s, 'stock', 'Ранее названа Ольга Корбут.')
+            result = planner.refine_scene(self.s, 'stock', 'Ранее названа Ольга Корбут.', 'ai')
         self.assertIn('source=stock', client.call_args.args[0])
         self.assertIn('Ранее названа Ольга', client.call_args.args[0])
         self.assertEqual(result['required_entities'], [])

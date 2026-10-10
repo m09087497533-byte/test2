@@ -126,7 +126,7 @@ class Project:
             'transition': 0, 'subtitles': False, 'allow_external': False,
             'photo_layout': 'auto', 'photo_effect': 'slide_up',
             'name_titles_enabled': True, 'min_scene': 6.0, 'photo_max': 14.0, 'video_max': 8.0,
-            'source_mode': 'auto', 'visual_verification': True,
+            'source_mode': 'auto', 'visual_verification': False, 'analysis_mode': 'basic',
         }
 
     def ensure_dirs(self):
@@ -188,7 +188,7 @@ class Project:
 
     def save(self):
         self.ensure_dirs()
-        data = {'version': 4, 'audio_path': str(self.audio_path),
+        data = {'version': 5, 'audio_path': str(self.audio_path),
                 'segments': self.segments, 'settings': self.settings}
         data.update(story=self.story, name_titles=self.name_titles, raw_transcript=self.raw_transcript)
         tmp = self.project_file.with_suffix('.json.tmp')
@@ -202,6 +202,9 @@ class Project:
         segments, repairs = normalize_segment_timing(data['segments']) if data.get('segments') else ([], 0)
         raw, raw_repairs = normalize_segment_timing(data['raw_transcript']) if data.get('raw_transcript') else ([], 0)
         self.settings.update(data.get('settings', {}))
+        # Older releases required AI verification; the desktop now uses context rules.
+        self.settings['analysis_mode'] = 'basic'
+        self.settings['visual_verification'] = False
         if data.get('version', 0) < 4 and self.settings['photo_layout'] == 'portrait_triptych':
             self.settings['photo_layout'] = 'auto'
         self.segments = segments
